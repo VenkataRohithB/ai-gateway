@@ -9,6 +9,6 @@ POSTGRES_USER=gateway
 POSTGRES_PASSWORD=$(openssl rand -hex 24)
 LITELLM_MASTER_KEY=sk-$(openssl rand -hex 32)
 LITELLM_SALT_KEY=sk-$(openssl rand -hex 32)
-OPENAI_API_KEY=
+GEMINI_API_KEY=
 EOT
-echo "wrote .env (secrets not printed). Add OPENAI_API_KEY yourself."
+echo "wrote .env (secrets not printed). Add GEMINI_API_KEY yourself."

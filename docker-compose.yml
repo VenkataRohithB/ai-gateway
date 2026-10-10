@@ -32,7 +32,7 @@ services:
     environment:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set in .env}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?set in .env}
-      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       DATABASE_URL: postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@db:5432/litellm
     volumes:
       - ./config/litellm.yaml:/app/config.yaml:ro

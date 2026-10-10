@@ -1,10 +1,10 @@
 # LiteLLM model routing. Version-controlled; secrets come from env via os.environ/.
 # Models are defined here (not in the DB/UI) so routing is reviewable in git.
 model_list:
-  - model_name: gpt-4o-mini            # public alias agents/policies refer to
+  - model_name: gemini-2.5-flash       # public alias agents/policies refer to
     litellm_params:
-      model: openai/gpt-4o-mini
-      api_key: os.environ/OPENAI_API_KEY
+      model: gemini/gemini-2.5-flash    # Google AI Studio (Gemini API)
+      api_key: os.environ/GEMINI_API_KEY
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY

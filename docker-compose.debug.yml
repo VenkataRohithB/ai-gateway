@@ -1,0 +1,5 @@
+# DEV-ONLY: publish LiteLLM on localhost for debugging. Never use in shared/prod envs;
+# it lets anything on this machine with the master key bypass the gateway.
+services:
+  litellm:
+    ports: ["127.0.0.1:${LITELLM_DEBUG_PORT:-4000}:4000"]

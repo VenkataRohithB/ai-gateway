@@ -48,3 +48,17 @@ Admin API example: `docker compose exec -T litellm python3 - GET /key/list < scr
 
 Add an entry to `config/litellm.yaml` (`api_key: os.environ/NAME`), pass `NAME` through in
 `docker-compose.yml`, set it in `.env`, then `docker compose up -d --force-recreate litellm`.
+
+## Milestone 1 verification (2026-10-10)
+
+| Check | Result |
+|---|---|
+| `docker compose ps` | db + litellm healthy; no host ports published |
+| `/health/readiness` | `status: healthy`, `db: connected` |
+| `scripts/smoke-test.sh` | 200, model `gemini-3.8-flash`, reply `gateway-ok`, usage returned (8 prompt / 89 completion tokens) |
+| Spend log | `LiteLLM_SpendLogs` row with spend `0.00033975` USD (LiteLLM's price table) |
+| Persistence | virtual key + spend log survive `docker compose down && up -d` |
+
+Note: `gemini-2.5-flash` returns 404 "no longer available to new users"; use `gemini-3.8-flash`.
+List models your key can use:
+`docker compose exec -T litellm python3 -c "import os,json,urllib.request as u; print([m['name'] for m in json.load(u.urlopen(u.Request('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200',headers={'x-goog-api-key':os.environ['GEMINI_API_KEY']})))['models']])"`

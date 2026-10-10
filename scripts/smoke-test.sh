@@ -3,7 +3,7 @@
 # so the master key is never printed). Prints model, reply and token usage only.
 set -euo pipefail
 cd "$(dirname "$0")/.."
-MODEL="${1:-gemini-2.5-flash}"
+MODEL="${1:-gemini-3.8-flash}"
 docker compose exec -T litellm python3 - POST /chat/completions \
   "{\"model\":\"$MODEL\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly: gateway-ok\"}]}" \
   < scripts/litellm_api.py | python3 -c '

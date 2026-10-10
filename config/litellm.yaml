@@ -1,9 +1,9 @@
 # LiteLLM model routing. Version-controlled; secrets come from env via os.environ/.
 # Models are defined here (not in the DB/UI) so routing is reviewable in git.
 model_list:
-  - model_name: gemini-2.5-flash       # public alias agents/policies refer to
+  - model_name: gemini-3.8-flash       # public alias agents/policies refer to
     litellm_params:
-      model: gemini/gemini-2.5-flash    # Google AI Studio (Gemini API)
+      model: gemini/gemini-3.8-flash    # Google AI Studio (Gemini API)
       api_key: os.environ/GEMINI_API_KEY
 
 general_settings:

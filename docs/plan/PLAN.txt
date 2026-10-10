@@ -1,0 +1,571 @@
+===============================================================================
+                    AI AGENT GATEWAY - PLAN OF ACTION (MVP)
+===============================================================================
+Repository : github.com/VenkataRohithB/ai-gateway
+Status     : Plan approved for review. Milestone 1 (LiteLLM + Postgres + Gemini)
+             of the original setup is done; build milestones M1-M10 below are
+             not started.
+Last update: 2026-10-10
+Sources    : docs/plan/PLAN.md (technical plan v2),
+             docs/plan/1-optimizer-draft.md, 2-reviewer-critique.md,
+             3-optimizer-response.md (design debate record)
+
+
+-------------------------------------------------------------------------------
+1. GOAL
+-------------------------------------------------------------------------------
+Manager's requirement:
+  "A gateway in front of AI agents to attribute and cap spend per agent and
+   per mandate, with hard ceilings and kill-switches. Withdrawing budget must
+   provably halt the agent. Access rules expressed as explicit, auditable
+   policy rather than code branches."
+
+First product : SynBioAI (5 agents)
+First real test client : ResearchOS
+Later : agentic grid, course co-pilot, other products
+
+In one sentence:
+  Every company agent calls ONE gateway instead of calling Gemini/OpenAI
+  directly. The gateway decides if each call is allowed, charges it to the
+  right agent and mandate, enforces hard budgets, records an audit trail,
+  and can stop any agent instantly.
+
+
+-------------------------------------------------------------------------------
+2. ARCHITECTURE
+-------------------------------------------------------------------------------
+
+   ResearchOS  --+
+   SynBioAI x5 --+--> OUR GATEWAY (FastAPI) :8080 --> LiteLLM --> Gemini API
+   Others      --+        |   (security gate)     (internal)   (more later)
+                          |
+                          +-- Dashboard  /admin/ui
+                          +-- Admin API  /admin/*
+                          +-- PostgreSQL (agents, mandates, budgets, audit)
+
+Who does what:
+  OUR GATEWAY : agent identity, policy, per-agent and per-mandate hard
+                budgets, kill switch, audit log, dashboard.
+  LiteLLM     : talks to model providers, holds provider keys, prices each
+                call, keeps its own spend log as a second record.
+  PostgreSQL  : all persistent state. Two databases: "gateway" (ours) and
+                "litellm" (LiteLLM's).
+  Docker      : runs everything locally. LiteLLM and Postgres are on an
+                internal network with NO public port, so agents cannot
+                bypass the gateway.
+
+
+-------------------------------------------------------------------------------
+3. "BUILDING ON TOP OF LITELLM" - DECISION
+-------------------------------------------------------------------------------
+Decision: use LiteLLM UNMODIFIED (pinned version 1.104.0), customised ONLY
+through its config file and environment variables. Our logic lives in a
+separate FastAPI gateway in front of it.
+
+Options considered:
+  (a) Separate FastAPI gateway in front of LiteLLM ........ CHOSEN
+  (b) Plug-in hooks inside LiteLLM (custom_auth) .......... kept as a later
+      option. Our auth would switch off LiteLLM's own checks, and our budget
+      code would depend on LiteLLM internals that change every release.
+  (c) Our own LiteLLM image with patches .................. rejected:
+      patches must be redone on every upgrade.
+  (d) Full git fork of LiteLLM ............................ rejected:
+      ~855k lines; we would own all its security fixes.
+
+Why LiteLLM's own budgets are NOT enough (verified in its source code):
+  - It checks "spent >= budget" BEFORE the call, then adds the cost AFTER.
+    Nothing is reserved, so simultaneous requests can all pass and overspend.
+  - Spend is written to the database only every 10 seconds, in batches.
+  - Spend is stored as a floating-point number.
+  -> The manager asked for a HARD ceiling, so our gateway enforces it.
+
+What we reuse from LiteLLM:
+  - Provider connections (Gemini now; OpenAI, Anthropic, etc. later)
+  - Price table and the real cost of each call (response header
+    x-litellm-response-cost)
+  - Its spend log, linked to our request IDs (header x-litellm-call-id)
+  - Agent/mandate tags in its spend log (header x-litellm-spend-logs-metadata)
+  - None of LiteLLM's paid "enterprise" features are needed.
+
+LiteLLM configuration changes (the "fork-kind" layer):
+  - Use the built-in price table (LITELLM_LOCAL_MODEL_COST_MAP=True) instead
+    of downloading prices from GitHub at startup.
+  - No automatic retries inside LiteLLM (num_retries: 0); the agent decides.
+  - Request timeout 240 s (default was 6000 s).
+  - 4 Gemini models: gemini-3.8-flash, gemini-3.7-flash, gemini-3.6-flash,
+    gemini-flash-latest.
+  - Its own restricted database user (not the Postgres superuser).
+  - One LiteLLM key "gateway" used only by our gateway, limited to the
+    4 models, with an overall budget as a safety backstop. The gateway
+    never uses the LiteLLM master key.
+  - LiteLLM's own UI is NOT used in the final product (debug only).
+
+
+-------------------------------------------------------------------------------
+4. HOW ONE REQUEST WORKS
+-------------------------------------------------------------------------------
+Agent sends:
+  POST http://<gateway>:8080/m/<mandate>/v1/chat/completions
+  Authorization: Bearer gw_<agent's own token>
+  { "model": "gemini-3.8-flash", "messages": [...] }
+
+Gateway steps:
+  1. Size check       body larger than 2 MB ......................... 413
+  2. Who is this?     token -> agent (only a hash is stored) ........ 401
+  3. Is it safe?      only approved fields allowed; rejects
+                      api_base, api_key, fallbacks, metadata, etc. .. 400
+  4. Policy check     rules in config/policy.toml ................... 403
+  5. Reserve budget   ONE database transaction re-checks agent
+                      status, mandate status, assignment, and both
+                      budgets together .............................. 402
+  6. Forward          rebuilt request sent to LiteLLM with the
+                      gateway's own LiteLLM key. Client headers are
+                      never forwarded.
+  7. Settle           charge the real cost, release the unused
+                      reservation, write the audit row.
+  8. Respond          model answer returned to the agent.
+
+Any denial stops at its step. The request never reaches LiteLLM or Gemini.
+
+Error codes (checked against ResearchOS's client):
+  401 bad token        -> ResearchOS stops (LLM_REFUSED)
+  402 budget exceeded  -> ResearchOS stops (LLM_REFUSED)
+  403 policy denied    -> ResearchOS stops (LLM_REFUSED)
+  400/413 bad request  -> ResearchOS stops (LLM_FAILED)
+  429/5xx from model   -> ResearchOS retries, then tries its next model
+  LiteLLM 401/403/422  -> becomes 503 UPSTREAM_UNAVAILABLE (internal details
+                          are not leaked to agents)
+
+
+-------------------------------------------------------------------------------
+5. POLICIES
+-------------------------------------------------------------------------------
+What a policy is:
+  A written rule that decides whether a request is allowed. All rules live in
+  ONE readable file, config/policy.toml, not scattered through the code.
+
+The policy file:
+
+  # Checked top to bottom. First rule that matches -> DENIED.
+  # No rule matches -> ALLOWED.
+
+  [[forbid]]
+  reason  = "AGENT_REVOKED"
+  when    = { "agent.status" = "revoked" }
+  message = "Agent credential revoked"
+
+  [[forbid]]
+  reason = "AGENT_INACTIVE"
+  when   = { "agent.status" = "suspended" }
+
+  [[forbid]]
+  reason = "MANDATE_NOT_ASSIGNED"
+  when   = { "assignment.exists" = false }
+
+  [[forbid]]
+  reason = "MANDATE_INACTIVE"
+  when   = { "mandate.status" = "suspended" }
+
+  [[forbid]]
+  reason = "MODEL_NOT_ALLOWED"
+  when   = { "model.allowed" = false }
+
+How a decision is made:
+  1. Facts are read fresh from the database for every request (no cache):
+       agent.status, assignment.exists, mandate.status, model.allowed
+  2. Rules are checked in order; the first match denies.
+  3. The decision is returned and saved in the audit log:
+       { "allow": false,
+         "reason": "MODEL_NOT_ALLOWED",
+         "message": "model gpt-5 is not allowed under mandate synbio-research",
+         "policy_version": "a3f9c21b04de" }
+     policy_version is a fingerprint of the policy file, so every past
+     decision can be traced to the exact rules that made it.
+
+Rules vs facts:
+  RULES (what gets blocked) : config/policy.toml - changed by editing the
+                              file, reviewed in git, gateway restart.
+  FACTS (who is revoked,    : database - changed instantly from the
+  assigned, allowed models)   dashboard or admin API.
+  Revoking an agent changes a FACT (agent.status = revoked); the existing
+  rule blocks it on the very next request. No policy edit needed.
+
+Budgets are checked separately:
+  AGENT_BUDGET_EXCEEDED and MANDATE_BUDGET_EXCEEDED are not in the policy
+  file. A budget check must read the balance AND reserve money in one atomic
+  database step, otherwise two simultaneous requests could both spend the
+  same last dollar. The decision has the same shape and is audited the same
+  way.
+
+Safety:
+  - Typo protection: if the file uses an unknown fact name, the gateway
+    refuses to start (a typo must never silently disable a rule).
+  - The file is pure data; it cannot execute code.
+  - Tests: one per rule, plus a test that the policy file and the database
+    re-check (step 5) always agree.
+  - Unknown mandates look the same as unassigned ones (no information leak).
+
+AWS Cedar later:
+  Each rule converts directly, e.g.
+    @id("AGENT_REVOKED")
+    forbid(principal, action, resource) when { principal.status == "revoked" };
+  Only gateway/policy.py is swapped. Database, routes, audit and dashboard
+  stay the same.
+
+Possible future rules (NOT in MVP): per-agent rate limits, time-of-day
+windows, max tokens per request per mandate.
+
+
+-------------------------------------------------------------------------------
+6. BUDGETS
+-------------------------------------------------------------------------------
+- Every agent has a budget. Every mandate has a budget. A request needs BOTH
+  to have room.
+- Money is stored as whole micro-dollars (1 USD = 1,000,000), never as
+  floating-point numbers.
+- Budgets are LIFETIME caps; an admin tops them up. (No monthly reset in MVP.)
+
+Per request:
+  1. ESTIMATE the worst-case cost before calling the model:
+       (request size x input price) + (max_tokens x output price)
+     - max_tokens defaults to 8192 if the agent doesn't send it; above
+       16384 is rejected. Exactly one max_tokens value is forwarded, the
+       same one used in the estimate.
+     - The estimate is deliberately high (~6x for ResearchOS), so near the
+       limit an agent is stopped slightly early rather than late.
+  2. RESERVE the estimate on both the agent and the mandate in one atomic
+     database transaction. If either lacks room -> 402, nothing forwarded.
+  3. SETTLE after the response:
+       success with cost from LiteLLM  -> charge real cost, free the rest
+       success but cost unknown        -> charge the reserved amount
+       timeout / outcome unknown       -> charge the reserved amount
+       model error (429, 5xx, etc.)    -> release, charge nothing
+  4. CLEANUP: a background sweeper settles any reservation left behind by a
+     crash (at startup, then every 60 s for stale ones).
+
+Concurrency: 50 requests arriving at once cannot overspend; tested.
+Overshoot: only possible by (requests already in flight) x (estimate error),
+e.g. if Gemini uses more "thinking" tokens than max_tokens. Documented.
+
+
+-------------------------------------------------------------------------------
+7. KILL SWITCH
+-------------------------------------------------------------------------------
+Actions (all from the dashboard or admin API, all audited):
+  - Suspend agent ........... blocks the agent under every mandate
+  - Revoke agent ............ permanent block (until explicitly restored)
+  - Suspend mandate ......... blocks every agent under that mandate
+  - Withdraw budget ......... set budget to 0 (agent or mandate)
+  - Unassign agent .......... removes agent from one mandate
+  - Restore ................. set the value back
+
+Guarantee:
+  Every request that has not started when the change is saved is denied
+  BEFORE it reaches LiteLLM or Gemini. State is in Postgres, so it survives
+  restarts.
+
+Not guaranteed (documented):
+  A request already in progress when you press the button finishes and is
+  charged. It is not cancelled.
+
+
+-------------------------------------------------------------------------------
+8. AUDIT LOG
+-------------------------------------------------------------------------------
+Every request and every admin action is recorded:
+  time, request ID, agent, mandate, model, allowed/denied, reason code,
+  policy version, reserved amount, actual cost and its source, prompt and
+  completion tokens, finish reason, model status code, admin before/after.
+
+NOT recorded: prompt or response content (agents may send confidential
+data).
+
+The gateway's database user can only ADD audit rows, not edit or delete
+them. This is append-only for the app, but NOT tamper-proof (a database
+superuser could still edit). Documented honestly.
+
+Invalid-token attempts (401) go to the operational log only, not the audit
+table (prevents log flooding).
+
+
+-------------------------------------------------------------------------------
+9. DASHBOARD (our own UI)
+-------------------------------------------------------------------------------
+URL: http://127.0.0.1:8080/admin/ui   Login: admin token
+
+Pages:
+  OVERVIEW  - total spend; spend per agent and per mandate vs limits;
+              allowed vs denied counts
+  AGENTS    - status, budget used/left, mandates, last request
+              actions: create (token shown once), suspend / revoke /
+              restore, change budget, rotate token
+  MANDATES  - status, budget, allowed models, assigned agents
+              actions: create, suspend / restore, change budget,
+              assign / unassign agents, edit allowed models
+  AUDIT LOG - every request and admin action; filter by agent, mandate,
+              denied only
+  MODELS    - configured models, prices, LiteLLM health (VIEW ONLY)
+  POLICY    - current rules and version (VIEW ONLY)
+
+Built as one HTML page with plain JavaScript, served by the gateway. No
+React, no build step. It only calls the admin API, so it cannot do anything
+the API doesn't allow.
+
+Not in the dashboard (on purpose): adding provider API keys, adding models,
+editing policy rules. Those stay in reviewed files (.env, config/*.yaml,
+config/policy.toml) so every change has a git record.
+
+
+-------------------------------------------------------------------------------
+10. API
+-------------------------------------------------------------------------------
+Agent:
+  POST /m/{mandate}/v1/chat/completions      agent token; OpenAI-compatible
+
+Health (no auth):
+  GET  /health/live                           process is up
+  GET  /health/ready                          database, LiteLLM, prices ok
+
+Admin (admin token):
+  POST   /admin/agents                        create agent
+  PATCH  /admin/agents/{id}                   status, budget
+  POST   /admin/agents/{id}/token             issue / rotate token (shown once)
+  POST   /admin/mandates                      create mandate
+  PATCH  /admin/mandates/{id}                 status, budget, allowed models
+  PUT    /admin/agents/{id}/mandates/{mid}    assign
+  DELETE /admin/agents/{id}/mandates/{mid}    unassign
+  GET    /admin/summary                       spend overview
+  GET    /admin/audit?agent=&mandate=&limit=  audit log
+  GET    /admin/ui                            dashboard
+
+Request fields agents may send:
+  model, messages, max_tokens OR max_completion_tokens (not both),
+  temperature, top_p, stop, seed, tools (function tools only), tool_choice,
+  response_format, n (must be 1), stream (must be false).
+  Anything else -> 400 FIELD_NOT_ALLOWED.
+
+
+-------------------------------------------------------------------------------
+11. SECURITY
+-------------------------------------------------------------------------------
+- Each agent has its own random token (gw_ + 256 bits). Only its SHA-256
+  hash is stored. Shown once at creation.
+- Agent identity comes ONLY from the token, never from the request body.
+- Admin token is separate from agent tokens; compared in constant time.
+- Every admin route requires the admin token (a test checks all routes).
+- Agents never see the Gemini key, the LiteLLM master key, or the gateway's
+  LiteLLM key.
+- LiteLLM has no public port; the dev-only debug port (127.0.0.1:4000) is
+  closed once ResearchOS moves to the gateway.
+- Separate database users:
+    litellm_app    owns LiteLLM's database only
+    gateway_owner  runs database migrations only
+    gateway_app    used by the gateway; audit is insert/select only
+    (Postgres's default "anyone can connect" is removed.)
+- Secrets live in .env (git-ignored) and .secrets/ (git-ignored). A test
+  checks no secrets are tracked in git.
+- Gemini paid built-in tools (Google Search, Maps) are blocked; their cost
+  cannot be estimated.
+- Streaming and images are rejected in the MVP.
+
+
+-------------------------------------------------------------------------------
+12. TESTING AND PROOF
+-------------------------------------------------------------------------------
+All automated tests use a FAKE model, so they cost nothing and are
+repeatable. Only one optional test calls real Gemini.
+
+  test_policy.py       every rule; typo protection; policy vs DB agreement
+  test_gateway.py      real Postgres, fake LiteLLM that counts calls:
+                       - missing / invalid token
+                       - one agent impersonating another
+                       - unassigned / unknown mandate
+                       - model not allowed
+                       - forbidden fields (api_base, fallbacks, metadata,
+                         both max-token fields, Gemini built-in tools)
+                       - revoked, suspended, budget exhausted
+                       - every admin route needs the admin token
+                       - 50 simultaneous requests cannot overspend
+                       -> on every denial the call counter stays unchanged
+  e2e_killswitch.py    full stack: gateway -> REAL LiteLLM -> fake model
+                       with a call counter. Prints PASS/FAIL for:
+                         1. agents A and B both get answers
+                         2. A's budget withdrawn -> A gets 402, B still works,
+                            counter only moves for B
+                         3. A revoked -> 403 AGENT_REVOKED
+                         4. gateway restarting -> request fails safely
+                         5. after restart, A still blocked
+                         6. LiteLLM's own spend log contains allowed request
+                            IDs and NOT denied ones
+                         7. A restored -> works again
+                         8. LiteLLM not publicly reachable; no secrets in git
+  live_gemini.sh       (optional) one real Gemini call through the full chain
+
+Tests run in a separate Docker project ("aigw-test") so they never touch
+your real data.
+
+
+-------------------------------------------------------------------------------
+13. BUILD ORDER (MILESTONES)
+-------------------------------------------------------------------------------
+Every milestone: explain files -> your OK -> build -> run tests -> show
+results -> commit and push (no AI attribution).
+
+M1  HARDEN LITELLM
+    Separate DB users (ownership moved in place, no data loss), built-in
+    price table, no retries, 240 s timeout, 4 models, "gateway" LiteLLM
+    key, block 3 leftover test keys, gen-env.sh --add-missing,
+    .secrets/ git-ignored.
+    Done when: LiteLLM connects as litellm_app (not superuser); ResearchOS
+    still works through :4000; leftover keys blocked.
+
+M2  GATEWAY SKELETON
+    Dockerfile, migrations, database tables, health checks, port 8080.
+    Done when: /health/ready shows db, litellm, prices all true; 6 tables
+    exist; no secrets visible inside the gateway container.
+
+M3  ADMIN API
+    Agents, mandates, assignments, tokens, admin audit; scripts/gw_admin.py.
+    Done when: you can create an agent and get its token; every admin action
+    is audited with before/after; no admin route works without the token.
+
+M4  POLICY + REQUEST GATE
+    policy.toml, evaluator, request validation, forwarding, deny audit.
+    Done when: all reason codes and security tests pass; fake model's call
+    counter stays 0 on every denial.
+
+M5  BUDGETS
+    Estimate, atomic reserve, settle/release, sweeper.
+    Done when: 50-simultaneous-request test passes; spend equals the sum of
+    audited costs.
+
+M6  KILL-SWITCH PROOF + 2-AGENT DEMO
+    Test stack, fake model, e2e_killswitch.py.
+    Done when: every step prints PASS with counter values.
+
+M7  DASHBOARD
+    Overview, Agents, Mandates, Audit, Models, Policy pages.
+    Done when: you can manage and suspend/restore agents from the browser,
+    using only the admin API.
+
+M8  ONE REAL GEMINI CALL
+    live_gemini.sh through gateway -> LiteLLM -> Gemini.
+    Done when: 200 response, real cost recorded in our audit log.
+
+M9  MOVE RESEARCHOS TO THE GATEWAY (config only, with your OK)
+    Create agent "researchos" and mandate "researchos-dev" (4 models).
+    ResearchOS .env:
+      LLM_BASE_URL=http://127.0.0.1:8080/m/researchos-dev/v1
+      LLM_API_KEY=<from .secrets/researchos.token>
+      LLM_MODEL=gemini-3.8-flash,gemini-3.7-flash,gemini-3.6-flash,gemini-flash-latest
+      LLM_TIMEOUT_SECONDS=300
+    Then block the old LiteLLM "researchos" key, delete .env.researchos,
+    close debug port 4000.
+    Done when: ResearchOS works only through the gateway; suspending it from
+    the dashboard stops it at its next call.
+
+M10 DOCUMENTATION
+    README: setup, architecture, how to run and verify, policy guide,
+    threat model, known limitations, SynBioAI onboarding guide.
+    Done when: another engineer can run everything from the README.
+
+
+-------------------------------------------------------------------------------
+14. PROJECT LAYOUT (target)
+-------------------------------------------------------------------------------
+  ai_gateway/
+    docker-compose.yml          db, litellm, migrate, gateway
+    docker-compose.debug.yml    dev only: LiteLLM on 127.0.0.1:4000
+    docker-compose.test.yml     fake model, test LiteLLM config, test runner
+    .env.example                placeholders only (.env is git-ignored)
+    config/
+      litellm.yaml              models and LiteLLM settings
+      litellm.test.yaml         test config pointing at the fake model
+      policy.toml               policy rules
+      db-init.sh                database users and permissions
+    gateway/
+      Dockerfile                python:3.13-slim, non-root
+      requirements.txt          pinned: fastapi 0.141.1, uvicorn 0.53.0,
+                                httpx 0.28.1, asyncpg 0.31.0, pytest 9.1.1
+      app.py                    agent, admin, health routes
+      db.py                     reserve / settle / release / sweep
+      policy.py                 load and evaluate policy.toml
+      migrate.py                applies migrations
+      migrations/001_init.sql   tables
+      dashboard.html            admin UI
+    scripts/
+      gen-env.sh  smoke-test.sh  litellm_api.py  gw_admin.py
+    tests/
+      test_policy.py  test_gateway.py  mock_upstream.py
+      e2e_killswitch.py  live_gemini.sh
+    docs/plan/                  this plan and the design debate
+
+
+-------------------------------------------------------------------------------
+15. MODELS, KEYS AND RATE LIMITS
+-------------------------------------------------------------------------------
+- Current Gemini key is FREE TIER: 5 requests/min and 20 requests/day PER
+  MODEL. This cannot support real agent work. A paid key is strongly
+  recommended before ResearchOS/SynBioAI use.
+- Fallbacks are client-side: ResearchOS lists 4 models and moves to the next
+  when one hits its limit. Each model is explicitly allowed and priced.
+  (LiteLLM's automatic fallbacks are deferred: the model that runs could
+  differ from the one authorized and priced.)
+- Adding a provider key: put it in .env, pass it through docker-compose.yml,
+  add a model entry in config/litellm.yaml, restart LiteLLM. Two keys under
+  the same model name = load-balanced (keys must be from different Google
+  projects to get separate quota).
+- Provider keys are managed in files, NOT in a UI.
+
+
+-------------------------------------------------------------------------------
+16. KNOWN LIMITATIONS (will be in the README)
+-------------------------------------------------------------------------------
+- Requests already in progress are not cancelled by a revoke.
+- Budget overshoot possible by (in-flight requests) x (estimate error).
+- Input cost is over-reserved (~6x for long prompts) -> agents near their
+  limit are stopped a little early.
+- Unknown outcomes (timeouts) are charged at the reserved amount.
+- No streaming, images, or Gemini built-in tools.
+- Lifetime budgets only (no monthly reset).
+- Audit log is append-only for the app, not tamper-proof.
+- One shared admin token (no per-person admin accounts yet).
+- No TLS locally.
+- Policy changes need a gateway restart.
+- Single gateway instance (not yet scaled to multiple copies).
+
+
+-------------------------------------------------------------------------------
+17. RISKS
+-------------------------------------------------------------------------------
+- Upgrading LiteLLM changes its price table; the e2e test checks costs.
+- Unverified whether Gemini 3.x "thinking" tokens respect max_tokens;
+  checked in M8/M9 via finish_reason and token counts.
+- Free-tier quota makes manual testing slow.
+
+
+-------------------------------------------------------------------------------
+18. DECISIONS (defaults - change any)
+-------------------------------------------------------------------------------
+1. Budgets: lifetime cap, manual top-up.
+2. Gemini key: continue on free tier; paid key recommended before M9.
+3. Dashboard: REQUIRED (M7), one simple page.
+4. Provider keys: managed in .env, not in the UI.
+5. Policy: 5 rules + budgets; extra rules (rate limits, time windows) later.
+
+
+-------------------------------------------------------------------------------
+19. AFTER THE MVP
+-------------------------------------------------------------------------------
+- SynBioAI's 5 agents (only with approval)
+- Streaming responses
+- Monthly / periodic budgets
+- Per-agent rate limits
+- More providers (OpenAI, Anthropic, Azure, Bedrock, self-hosted)
+- AWS Cedar policy engine
+- ToolHive capability-scoped tool execution
+- Per-person admin accounts / SSO
+- Cloud deployment (e.g. AWS EC2) - only with approval
+- Multiple gateway instances
+
+===============================================================================

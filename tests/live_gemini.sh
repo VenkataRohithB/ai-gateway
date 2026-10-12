@@ -6,6 +6,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 MANDATE="${1:-demo}"; TOKEN_FILE="${2:-.secrets/demo-a.token}"; MODEL="${3:-gemini-3.7-flash}"
+read -r -p "This makes a REAL, paid Gemini call ($MODEL via mandate $MANDATE). Continue? [y/N] " ok; [ "$ok" = y ] || exit 1
 TOKEN="$(cat "$TOKEN_FILE")"
 RESP="$(curl -s -D - "http://127.0.0.1:${GATEWAY_PORT:-8080}/m/$MANDATE/v1/chat/completions" \
   -H "Authorization: Bearer $TOKEN" -H 'Content-Type: application/json' \

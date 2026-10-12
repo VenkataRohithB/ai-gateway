@@ -6,7 +6,7 @@ prove a denied request never reached the model.
   GET  /count                {"count": n, "last": <last request body>}
   POST /reset                count = 0
 """
-import json, threading, time
+import json, threading, time, uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 lock = threading.Lock()
@@ -41,7 +41,7 @@ class Handler(BaseHTTPRequestHandler):
                 count += 1
                 last = req
             return self._send(200, {
-                "id": f"mock-{count}", "object": "chat.completion", "created": int(time.time()),
+                "id": f"mock-{uuid.uuid4().hex}", "object": "chat.completion", "created": int(time.time()),
                 "model": req.get("model", "mock-model"),
                 "choices": [{"index": 0, "message": {"role": "assistant", "content": "mock reply"}, "finish_reason": "stop"}],
                 "usage": {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15}})

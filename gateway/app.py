@@ -35,6 +35,7 @@ SWEEP_EVERY, SWEEP_AFTER = 60, UPSTREAM_TIMEOUT + 300
 
 log = logging.getLogger("gateway")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
+logging.getLogger("httpx").setLevel(logging.WARNING)  # no per-request noise
 
 def log_event(**fields) -> None:
     log.info(json.dumps(fields, default=str))

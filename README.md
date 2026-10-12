@@ -3,8 +3,8 @@
 Central gateway in front of company AI agents: attribute and cap spend per agent and per
 mandate, with hard ceilings and kill-switches. First consumer: SynBioAI.
 
-**Status:** Milestone 1 (LiteLLM + Postgres + Gemini). FastAPI authorization gate, policy,
-budgets and revocation are upcoming milestones.
+**Status:** M1 (hardened LiteLLM) done. Gateway, policy, budgets, kill switch and dashboard
+are upcoming milestones; see `docs/plan/PLAN.txt`.
 
 ## Architecture (target)
 
@@ -23,10 +23,36 @@ Prereqs: Docker + Compose v2, a Gemini API key from https://aistudio.google.com/
 ```bash
 scripts/gen-env.sh                 # creates .env with random secrets (never overwrites)
 $EDITOR .env                       # set GEMINI_API_KEY=...
-docker compose up -d
+docker compose up -d               # fresh volume: DB roles are created automatically
 docker compose ps                  # db + litellm should be "healthy"
+scripts/litellm-setup.sh           # creates the scoped "gateway" LiteLLM key (idempotent)
 scripts/smoke-test.sh              # real completion through LiteLLM
 ```
+
+Upgrading an existing checkout/volume to M1:
+
+```bash
+scripts/gen-env.sh --add-missing   # appends new secrets, never changes existing ones
+docker compose stop litellm && docker compose up -d db
+docker compose exec -T db bash < config/db-init.sh   # roles + ownership move (idempotent)
+docker compose up -d && scripts/litellm-setup.sh
+```
+
+### Database roles
+
+| Role | Used by | Rights |
+|---|---|---|
+| `gateway` (POSTGRES_USER) | bootstrap / manual admin only | superuser |
+| `litellm_app` | LiteLLM | owns db `litellm`; cannot connect to `gateway` |
+| `gateway_owner` | gateway migrations (M2) | owns db `gateway` |
+| `gateway_app` | gateway runtime (M2) | connect to `gateway` only |
+
+### LiteLLM settings that matter
+- 4 models (`gemini-3.8-flash`, `gemini-3.7-flash`, `gemini-3.6-flash`, `gemini-flash-latest`),
+  each with its own free-tier quota.
+- `num_retries: 0` (no hidden retries), `request_timeout: 240`.
+- `LITELLM_LOCAL_MODEL_COST_MAP=True`: prices come from the pinned image, not GitHub.
+- Virtual key `gateway` (4 models, $10 backstop) is what the FastAPI gateway will use.
 
 Keep `.env`: `LITELLM_SALT_KEY` must stay stable, LiteLLM encrypts stored credentials with it.
 
@@ -35,6 +61,8 @@ Keep `.env`: `LITELLM_SALT_KEY` must stay stable, LiteLLM encrypts stored creden
 | `docker-compose.yml` | Postgres 16 + LiteLLM 1.104.0 (pinned by digest) |
 | `docker-compose.debug.yml` | Dev only: exposes LiteLLM on 127.0.0.1:4000 (`docker compose -f docker-compose.yml -f docker-compose.debug.yml up -d`) |
 | `config/litellm.yaml` | Model routing (version-controlled; models are not stored in DB/UI) |
+| `scripts/litellm-setup.sh` | Create the scoped `gateway` virtual key |
+| `config/db-init.sh` | Least-privilege Postgres roles |
 | `scripts/litellm_api.py` | Call the LiteLLM admin API from inside the container without printing the master key |
 
 Admin API example: `docker compose exec -T litellm python3 - GET /key/list < scripts/litellm_api.py`

@@ -1,10 +1,16 @@
-# LiteLLM model routing. Version-controlled; secrets come from env via os.environ/.
-# Models are defined here (not in the DB/UI) so routing is reviewable in git.
+# LiteLLM routing. Version-controlled; secrets come from env via os.environ/.
+# Models live here (not in the DB/UI) so every change is reviewable in git.
+# All four aliases use the same Gemini key; each model has its own free-tier quota,
+# which is why agents list several (client-side fallback).
 model_list:
-  - model_name: gemini-3.8-flash       # public alias agents/policies refer to
-    litellm_params:
-      model: gemini/gemini-3.8-flash    # Google AI Studio (Gemini API)
-      api_key: os.environ/GEMINI_API_KEY
+  - model_name: gemini-3.8-flash
+    litellm_params: { model: gemini/gemini-3.8-flash, api_key: os.environ/GEMINI_API_KEY }
+  - model_name: gemini-3.7-flash
+    litellm_params: { model: gemini/gemini-3.7-flash, api_key: os.environ/GEMINI_API_KEY }
+  - model_name: gemini-3.6-flash
+    litellm_params: { model: gemini/gemini-3.6-flash, api_key: os.environ/GEMINI_API_KEY }
+  - model_name: gemini-flash-latest
+    litellm_params: { model: gemini/gemini-flash-latest, api_key: os.environ/GEMINI_API_KEY }
 
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
@@ -14,3 +20,7 @@ general_settings:
 litellm_settings:
   drop_params: false
   turn_off_message_logging: true        # don't persist prompt/response content
+  request_timeout: 240                  # < gateway timeout (270s) < client timeout (300s)
+
+router_settings:
+  num_retries: 0                        # no hidden retries; the calling agent decides

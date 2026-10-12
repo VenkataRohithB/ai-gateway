@@ -13,9 +13,13 @@ services:
       POSTGRES_USER: ${POSTGRES_USER:-gateway}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set in .env}
       POSTGRES_DB: litellm
+      # read by config/db-init.sh to create the least-privilege roles
+      LITELLM_DB_PASSWORD: ${LITELLM_DB_PASSWORD:?set in .env}
+      GATEWAY_OWNER_PASSWORD: ${GATEWAY_OWNER_PASSWORD:?set in .env}
+      GATEWAY_APP_PASSWORD: ${GATEWAY_APP_PASSWORD:?set in .env}
     volumes:
       - pgdata:/var/lib/postgresql/data
-      - ./config/postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./config/db-init.sh:/docker-entrypoint-initdb.d/01-db-init.sh:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d litellm"]
       interval: 5s
@@ -33,7 +37,8 @@ services:
       LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set in .env}
       LITELLM_SALT_KEY: ${LITELLM_SALT_KEY:?set in .env}
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
-      DATABASE_URL: postgresql://${POSTGRES_USER:-gateway}:${POSTGRES_PASSWORD}@db:5432/litellm
+      DATABASE_URL: postgresql://litellm_app:${LITELLM_DB_PASSWORD}@db:5432/litellm
+      LITELLM_LOCAL_MODEL_COST_MAP: "True"   # prices from the pinned image, not fetched from GitHub
     volumes:
       - ./config/litellm.yaml:/app/config.yaml:ro
     depends_on:

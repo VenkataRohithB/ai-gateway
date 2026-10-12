@@ -4,9 +4,9 @@ Agent route : POST /m/{mandate}/v1/chat/completions   (agent bearer token)
 Admin routes: /admin/*                                 (ADMIN_TOKEN)
 Health      : /health/live, /health/ready
 """
-import hashlib, hmac, json, logging, os, secrets, uuid
+import asyncio, hashlib, hmac, json, logging, os, secrets, uuid
 from contextlib import asynccontextmanager
-from decimal import ROUND_HALF_EVEN, Decimal
+from decimal import ROUND_CEILING, ROUND_HALF_EVEN, Decimal, InvalidOperation
 from typing import Literal
 
 import asyncpg, httpx
@@ -14,6 +14,10 @@ from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+
+import db
+from db import audit
+from policy import Policy
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000")
@@ -23,6 +27,11 @@ UPSTREAM_TRANSPORT = None  # tests replace this with httpx.MockTransport
 ADMIN_TOKEN = os.environ["ADMIN_TOKEN"].encode()
 SLUG = r"^[a-z0-9-]{1,64}$"
 MICROS = 1_000_000
+POLICY = Policy(os.environ.get("POLICY_FILE", "/config/policy.toml"))  # invalid policy -> refuse to start
+MAX_BODY_BYTES = 2 * 1024 * 1024
+DEFAULT_MAX_TOKENS = 8192   # used when the agent sends no max_tokens; it is forwarded and priced
+MAX_MAX_TOKENS = 16384
+SWEEP_EVERY, SWEEP_AFTER = 60, UPSTREAM_TIMEOUT + 300
 
 log = logging.getLogger("gateway")
 logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -59,9 +68,21 @@ async def lifespan(app: FastAPI):
         await load_prices()
     except Exception as e:  # LiteLLM may still be starting; /health/ready retries
         log_event(event="prices_unavailable", error=type(e).__name__)
+    log_event(event="startup", policy_version=POLICY.version, swept=await db.sweep(state.pool, None))
+    sweeper = asyncio.create_task(sweep_forever())
     yield
+    sweeper.cancel()
     await state.http.aclose()
     await state.pool.close()
+
+async def sweep_forever() -> None:
+    while True:
+        await asyncio.sleep(SWEEP_EVERY)
+        try:
+            if n := await db.sweep(state.pool, SWEEP_AFTER):
+                log_event(event="swept_stale_reservations", count=n)
+        except Exception:
+            log.exception("sweeper failed")
 
 app = FastAPI(title="AI Agent Gateway", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
 
@@ -69,12 +90,13 @@ app = FastAPI(title="AI Agent Gateway", lifespan=lifespan, docs_url=None, redoc_
 # ---------------------------------------------------------------------------- errors
 class GatewayError(Exception):
     """Every non-2xx answer: {"error": {"code", "message", ...}}. Never contains internals."""
-    def __init__(self, status: int, code: str, message: str, **extra):
-        self.status, self.body = status, {"error": {"code": code, "message": message, **extra}}
+    def __init__(self, status: int, code: str, message: str, headers: dict | None = None, **extra):
+        self.status, self.headers = status, headers
+        self.body = {"error": {"code": code, "message": message, **extra}}
 
 @app.exception_handler(GatewayError)
 async def _gateway_error(request: Request, e: GatewayError):
-    return JSONResponse(e.body, status_code=e.status)
+    return JSONResponse(e.body, status_code=e.status, headers=e.headers)
 
 @app.exception_handler(RequestValidationError)
 async def _validation_error(request: Request, e: RequestValidationError):
@@ -97,18 +119,6 @@ def usd(micros: int | None) -> str | None:
 
 def token_hash(token: str) -> bytes:
     return hashlib.sha256(token.encode()).digest()
-
-AUDIT_COLUMNS = {"kind", "actor", "request_id", "agent_id", "mandate_id", "model", "decision", "reason_code",
-                 "policy_version", "reserved_micros", "cost_micros", "cost_source", "prompt_tokens",
-                 "completion_tokens", "finish_reason", "upstream_status", "detail"}
-
-async def audit(conn, **fields) -> None:
-    assert set(fields) <= AUDIT_COLUMNS, set(fields) - AUDIT_COLUMNS
-    fields["detail"] = json.dumps(fields.get("detail") or {}, default=str)
-    cols = list(fields)
-    await conn.execute(f"INSERT INTO audit_events ({', '.join(cols)}) VALUES "
-                       f"({', '.join(f'${i + 1}' + ('::jsonb' if c == 'detail' else '') for i, c in enumerate(cols))})",
-                       *fields.values())
 
 def ledger_view(row) -> dict:
     d = dict(row)
@@ -283,6 +293,7 @@ async def summary():
         "SELECT count(*) FILTER (WHERE decision='allow') AS allowed, count(*) FILTER (WHERE decision='deny') AS denied "
         "FROM audit_events WHERE kind='request' AND at > now() - interval '24 hours'")
     return {"agents": await list_agents(), "mandates": await list_mandates(), "last_24h": dict(counts),
+            "policy": {"version": POLICY.version, "rules": POLICY.rules},
             "models": {m: {"input_usd_per_1m": str(i * MICROS), "output_usd_per_1m": str(o * MICROS)}
                        for m, (i, o) in sorted(state.prices.items())}}
 
@@ -311,3 +322,202 @@ async def ready():
 
 
 app.include_router(admin)
+
+
+# ---------------------------------------------------------------------------- agent API
+ALLOWED_FIELDS = {"model", "messages", "max_tokens", "max_completion_tokens", "temperature", "top_p", "stop",
+                  "seed", "tools", "tool_choice", "response_format", "n", "stream"}
+
+def _bad(code: str, message: str):
+    raise GatewayError(400, code, message)
+
+def _is_num(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+def validate_body(raw: bytes) -> tuple[dict, str, int]:
+    """Strict allowlist. Returns (outbound body rebuilt from validated fields, model, max_tokens).
+    Anything that could re-route the request, change credentials, or make cost unbounded is rejected."""
+    try:
+        body = json.loads(raw)
+    except ValueError:
+        _bad("INVALID_JSON", "body is not valid JSON")
+    if not isinstance(body, dict):
+        _bad("INVALID_REQUEST", "body must be a JSON object")
+    body = {k: v for k, v in body.items() if v is not None}
+    if extra := sorted(set(body) - ALLOWED_FIELDS):
+        _bad("FIELD_NOT_ALLOWED", f"field(s) not allowed: {', '.join(extra)}")
+    model = body.get("model")
+    if not isinstance(model, str) or not 0 < len(model) <= 128:
+        _bad("INVALID_REQUEST", "model must be a non-empty string")
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        _bad("INVALID_REQUEST", "messages must be a non-empty list")
+    for m in messages:
+        if not isinstance(m, dict) or not isinstance(m.get("role"), str):
+            _bad("INVALID_REQUEST", "each message needs a string role")
+        content = m.get("content")
+        if isinstance(content, list):
+            if not all(isinstance(p, dict) and p.get("type") == "text" and isinstance(p.get("text"), str) for p in content):
+                _bad("CONTENT_NOT_ALLOWED", "only text content parts are supported (no images/audio/files)")
+        elif content is not None and not isinstance(content, str):
+            _bad("INVALID_REQUEST", "message content must be a string, null, or text parts")
+    if "max_tokens" in body and "max_completion_tokens" in body:
+        _bad("INVALID_REQUEST", "send max_tokens or max_completion_tokens, not both")
+    max_tokens = body.get("max_tokens", body.get("max_completion_tokens", DEFAULT_MAX_TOKENS))
+    if type(max_tokens) is not int or not 1 <= max_tokens <= MAX_MAX_TOKENS:
+        _bad("INVALID_REQUEST", f"max_tokens must be an integer from 1 to {MAX_MAX_TOKENS}")
+    if body.get("stream", False) is not False:
+        _bad("STREAMING_NOT_SUPPORTED", "stream=true is not supported yet")
+    if body.get("n", 1) != 1 or type(body.get("n", 1)) is not int:
+        _bad("INVALID_REQUEST", "n must be 1")
+    tools = body.get("tools", [])
+    if not isinstance(tools, list) or not all(isinstance(t, dict) and t.get("type") == "function"
+                                              and isinstance(t.get("function"), dict) for t in tools):
+        _bad("TOOL_NOT_ALLOWED", "only function tools are allowed (no provider built-in tools)")
+    for k in ("temperature", "top_p"):
+        if k in body and not _is_num(body[k]):
+            _bad("INVALID_REQUEST", f"{k} must be a number")
+    if "seed" in body and type(body["seed"]) is not int:
+        _bad("INVALID_REQUEST", "seed must be an integer")
+    if "stop" in body and not (isinstance(body["stop"], str) or
+                               (isinstance(body["stop"], list) and all(isinstance(x, str) for x in body["stop"]))):
+        _bad("INVALID_REQUEST", "stop must be a string or list of strings")
+    if "tool_choice" in body and not isinstance(body["tool_choice"], (str, dict)):
+        _bad("INVALID_REQUEST", "tool_choice must be a string or object")
+    if "response_format" in body and not isinstance(body["response_format"], dict):
+        _bad("INVALID_REQUEST", "response_format must be an object")
+    outbound = {k: v for k, v in body.items() if k not in ("max_tokens", "max_completion_tokens", "stream", "n")}
+    outbound["max_tokens"] = max_tokens  # exactly one cap, the one that was priced
+    return outbound, model, max_tokens
+
+def estimate_micros(model: str, outbound_len: int, max_tokens: int) -> int:
+    """Worst-case cost: every request byte counted as an input token (bytes >= tokens) plus the full output cap."""
+    pin, pout = state.prices[model]
+    return int(((outbound_len * pin + max_tokens * pout) * MICROS).to_integral_value(rounding=ROUND_CEILING))
+
+def parse_cost(header: str | None) -> Decimal | None:
+    try:
+        cost = Decimal(header)
+    except (TypeError, InvalidOperation):
+        return None
+    return cost if cost.is_finite() and cost > 0 else None
+
+async def gather_facts(agent_id: str, mandate_id: str, model: str) -> dict:
+    row = await state.pool.fetchrow(
+        "SELECT a.status AS agent_status, m.status AS mandate_status, m.allowed_models, "
+        "EXISTS (SELECT 1 FROM agent_mandates WHERE agent_id=a.id AND mandate_id=$2) AS assigned "
+        "FROM agents a LEFT JOIN mandates m ON m.id=$2 WHERE a.id=$1", agent_id, mandate_id)
+    return {"agent.status": row["agent_status"], "assignment.exists": row["assigned"],
+            "mandate.status": row["mandate_status"] or "unknown",
+            "model.allowed": model in (row["allowed_models"] or []) and model in state.prices}
+
+@app.post("/m/{mandate_id}/v1/chat/completions")
+async def chat_completions(mandate_id: str, request: Request, authorization: str = Header(default="")):
+    request_id = uuid.uuid4()
+    rid = str(request_id)
+    mandate_id = mandate_id[:64]
+
+    # 1. Authenticate: identity comes only from the token.
+    scheme, _, token = authorization.partition(" ")
+    agent_id = None
+    if scheme.lower() == "bearer" and token.startswith("gw_"):
+        agent_id = await state.pool.fetchval("SELECT id FROM agents WHERE token_sha256=$1", token_hash(token))
+    if not agent_id:  # not audited (unauthenticated callers could flood the audit table)
+        log_event(event="auth_failed", request_id=rid, mandate=mandate_id, client=request.client.host if request.client else None)
+        raise GatewayError(401, "UNAUTHORIZED", "missing or invalid agent token", request_id=rid)
+
+    async def deny(status: int, code: str, message: str, model: str | None = None, policy_version: str | None = None):
+        await audit(state.pool, kind="request", actor=agent_id, request_id=request_id, agent_id=agent_id,
+                    mandate_id=mandate_id, model=model, decision="deny", reason_code=code, policy_version=policy_version)
+        log_event(event="deny", request_id=rid, agent=agent_id, mandate=mandate_id, model=model, reason=code)
+        raise GatewayError(status, code, message, request_id=rid,
+                           **({"policy_version": policy_version} if policy_version else {}))
+
+    # 2. Validate size and body.
+    declared = request.headers.get("content-length", "")
+    if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+        await deny(413, "REQUEST_TOO_LARGE", f"body over {MAX_BODY_BYTES} bytes")
+    raw = await request.body()
+    if len(raw) > MAX_BODY_BYTES:
+        await deny(413, "REQUEST_TOO_LARGE", f"body over {MAX_BODY_BYTES} bytes")
+    try:
+        outbound, model, max_tokens = validate_body(raw)
+    except GatewayError as e:
+        await deny(e.status, e.body["error"]["code"], e.body["error"]["message"])
+
+    # 3. Policy (explicit rules in config/policy.toml) on fresh facts.
+    decision = POLICY.evaluate(await gather_facts(agent_id, mandate_id, model))
+    if not decision["allow"]:
+        await deny(403, decision["reason"], decision["message"], model, decision["policy_version"])
+
+    # 4. Reserve worst-case cost on agent + mandate; the same transaction re-checks the kill-switch facts.
+    out_bytes = json.dumps(outbound, separators=(",", ":")).encode()
+    est = estimate_micros(model, len(out_bytes), max_tokens)
+    failed = await db.reserve(state.pool, request_id, agent_id, mandate_id, model, est, POLICY.version)
+    if failed:
+        decision = POLICY.evaluate(await gather_facts(agent_id, mandate_id, model))
+        if not decision["allow"]:  # state changed concurrently (e.g. revoked just now)
+            await deny(403, decision["reason"], decision["message"], model, decision["policy_version"])
+        code = {"assignment": "MANDATE_NOT_ASSIGNED", "agent": "AGENT_BUDGET_EXCEEDED",
+                "mandate": "MANDATE_BUDGET_EXCEEDED"}[failed]
+        await deny(402 if failed != "assignment" else 403, code,
+                   f"{'agent' if failed == 'agent' else 'mandate'} budget cannot cover this request "
+                   f"(worst-case estimate {usd(est)} USD)" if failed != "assignment" else "agent is not assigned to this mandate",
+                   model, POLICY.version)
+
+    # 5. Forward with the gateway's own LiteLLM key. No client headers are forwarded.
+    async def close(outcome: str, cost: int | None = None, source: str = "none", **extra):
+        await db.settle(state.pool, request_id, outcome, cost, source, actor=agent_id, **extra)
+        log_event(event=outcome, request_id=rid, agent=agent_id, mandate=mandate_id, model=model,
+                  reserved=est, cost=cost if outcome == "settled" else 0, source=source, **extra)
+
+    headers = {"content-type": "application/json", "x-litellm-call-id": rid,
+               "x-litellm-spend-logs-metadata": json.dumps({"agent_id": agent_id, "mandate_id": mandate_id})}
+    try:
+        r = await state.http.post("/v1/chat/completions", content=out_bytes, headers=headers)
+    except (httpx.ConnectError, httpx.ConnectTimeout):  # never sent: nothing billed
+        await close("released", upstream_status=None)
+        raise GatewayError(503, "UPSTREAM_UNAVAILABLE", "model gateway unavailable", request_id=rid)
+    except httpx.TransportError:  # sent, outcome unknown: charge the reservation
+        await close("settled", None, "reservation", detail={"error": "upstream timeout or connection lost"})
+        raise GatewayError(504, "UPSTREAM_TIMEOUT", "model call timed out; charged at the reserved amount", request_id=rid)
+
+    # 6. Settle and respond.
+    if r.status_code == 200:
+        try:
+            data = r.json()
+            choice = data["choices"][0]
+        except (ValueError, KeyError, IndexError, TypeError):
+            await close("settled", None, "reservation", upstream_status=200, detail={"error": "unparseable response"})
+            raise GatewayError(502, "UPSTREAM_ERROR", "invalid response from model", request_id=rid)
+        usage = data.get("usage") or {}
+        cost = parse_cost(r.headers.get("x-litellm-response-cost"))
+        if cost is not None:
+            charge, source = int((cost * MICROS).to_integral_value(rounding=ROUND_CEILING)), "litellm_header"
+        elif (usage.get("total_tokens") or 0) > 0:
+            charge, source = None, "reservation"  # tokens used but cost unknown: charge the reservation
+        else:
+            charge, source = 0, "none"
+        await close("settled", charge, source, upstream_status=200, prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"), finish_reason=choice.get("finish_reason"))
+        return JSONResponse(data, headers={"x-request-id": rid})
+
+    upstream_msg = ""
+    try:
+        upstream_msg = str((r.json().get("error") or {}).get("message", ""))[:500]
+    except Exception:
+        pass
+    log_event(event="upstream_error", request_id=rid, status=r.status_code, message=upstream_msg[:200])
+    if r.status_code in (408, 504):
+        await close("settled", None, "reservation", upstream_status=r.status_code)
+        raise GatewayError(504, "UPSTREAM_TIMEOUT", "model call timed out; charged at the reserved amount", request_id=rid)
+    await close("released", upstream_status=r.status_code)
+    if r.status_code in (401, 403, 422):  # gateway key problem or backstop budget: never leak details to agents
+        raise GatewayError(503, "UPSTREAM_UNAVAILABLE", "model gateway unavailable", request_id=rid)
+    if r.status_code == 429:
+        retry = {"retry-after": r.headers["retry-after"]} if "retry-after" in r.headers else None
+        raise GatewayError(429, "UPSTREAM_RATE_LIMITED", "model provider rate limit; retry later or use another model",
+                           headers=retry, request_id=rid)
+    status = r.status_code if 400 <= r.status_code < 600 else 502
+    raise GatewayError(status, "UPSTREAM_ERROR", upstream_msg if status in (400, 404) else "model provider error",
+                       request_id=rid)

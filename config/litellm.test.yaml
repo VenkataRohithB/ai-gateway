@@ -1,0 +1,28 @@
+# Test-only LiteLLM config: routes to tests/mock_upstream.py, never to a real provider.
+model_list:
+  - model_name: mock-model
+    litellm_params:
+      model: openai/mock-model
+      api_base: http://mock-upstream:9000/v1
+      api_key: not-a-secret
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000002
+  - model_name: mock-model-2
+    litellm_params:
+      model: openai/mock-model-2
+      api_base: http://mock-upstream:9000/v1
+      api_key: not-a-secret
+      input_cost_per_token: 0.000001
+      output_cost_per_token: 0.000002
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
+  database_url: os.environ/DATABASE_URL
+  store_model_in_db: false
+
+litellm_settings:
+  turn_off_message_logging: true
+  request_timeout: 240
+
+router_settings:
+  num_retries: 0

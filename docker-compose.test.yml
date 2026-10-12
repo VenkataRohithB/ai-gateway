@@ -1,0 +1,35 @@
+# Test stack overlay. Always use a separate project so tests never touch real data:
+#   scripts/test.sh            (runs everything)
+# LiteLLM is pointed at a counting fake model; no real provider is ever called.
+services:
+  litellm:
+    volumes:
+      - ./config/litellm.test.yaml:/app/config.yaml:ro   # replaces the real model list
+    depends_on:
+      mock-upstream: { condition: service_started }
+
+  mock-upstream:
+    image: python:3.13-slim@sha256:70729b46c69b4f1e97c4822c1af3df53a1476cf5ddc6c087c0c10bc3a5678c2f
+    command: ["python", "/tests/mock_upstream.py"]
+    volumes: ["./tests:/tests:ro"]
+    ports: ["127.0.0.1:${MOCK_PORT:-19000}:9000"]        # host reads the call counter
+    networks: [backend]
+
+  tests:
+    profiles: [tests]
+    build: { context: ./gateway, target: test }
+    image: ai-agent-gateway:test
+    command: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "/tests/test_policy.py", "/tests/test_gateway.py"]
+    environment:
+      DATABASE_URL: postgresql://gateway_app:${GATEWAY_APP_PASSWORD}@db:5432/gateway
+      OWNER_DATABASE_URL: postgresql://gateway_owner:${GATEWAY_OWNER_PASSWORD}@db:5432/gateway
+      LITELLM_GATEWAY_KEY: sk-test-upstream-is-mocked
+      ADMIN_TOKEN: adm_test-admin-token
+      POLICY_FILE: /config/policy.toml
+      PYTHONPATH: /app
+    volumes:
+      - ./tests:/tests:ro
+      - ./config/policy.toml:/config/policy.toml:ro
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    networks: [backend]

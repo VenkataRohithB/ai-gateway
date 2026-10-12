@@ -1,1 +1,45 @@
-# Policy rules are added in M4.
+# Gateway access policy. Explicit, reviewable data - not code.
+#
+# Evaluated top to bottom for every model request. The FIRST rule whose `when`
+# facts all match DENIES the request with that rule's reason code.
+# If no rule matches, policy ALLOWS (budgets are then checked atomically).
+#
+# Facts available (gathered fresh from the database for each request):
+#   agent.status       "active" | "suspended" | "revoked"
+#   assignment.exists  true if the agent is assigned to the requested mandate
+#   mandate.status     "active" | "suspended" | "unknown" (mandate does not exist)
+#   model.allowed      true if the requested model is in the mandate's allowed_models
+#                      and is configured + priced in LiteLLM
+#
+# Changing this file changes policy_version (sha256 prefix) recorded on every decision.
+# Restart the gateway to load changes:  docker compose restart gateway
+
+[[forbid]]
+reason  = "AGENT_REVOKED"
+when    = { "agent.status" = "revoked" }
+message = "agent credential has been revoked"
+
+[[forbid]]
+reason  = "AGENT_INACTIVE"
+when    = { "agent.status" = "suspended" }
+message = "agent is suspended"
+
+[[forbid]]
+reason  = "MANDATE_NOT_ASSIGNED"          # unknown mandates look the same (no enumeration)
+when    = { "assignment.exists" = false }
+message = "agent is not assigned to this mandate"
+
+[[forbid]]
+reason  = "MANDATE_NOT_ASSIGNED"          # mandate does not exist: same answer as unassigned
+when    = { "mandate.status" = "unknown" }
+message = "agent is not assigned to this mandate"
+
+[[forbid]]
+reason  = "MANDATE_INACTIVE"
+when    = { "mandate.status" = "suspended" }
+message = "mandate is suspended"
+
+[[forbid]]
+reason  = "MODEL_NOT_ALLOWED"
+when    = { "model.allowed" = false }
+message = "model is not allowed under this mandate"

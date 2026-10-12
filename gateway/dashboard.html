@@ -1,0 +1,277 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Gateway</title>
+<style>
+:root {
+  --bg: #f6f7f9; --panel: #fff; --text: #1b1f24; --muted: #667085; --line: #e3e6ea;
+  --accent: #2f5bd3; --ok: #1a7f4b; --warn: #b26b00; --bad: #c0362c; --chip: #eef1f5;
+}
+@media (prefers-color-scheme: dark) {
+  :root { --bg: #111418; --panel: #191d23; --text: #e6e8eb; --muted: #98a2b3; --line: #2a3038;
+          --accent: #7b9bff; --ok: #4cc38a; --warn: #f0a83a; --bad: #ff6b5e; --chip: #232932; }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; background: var(--bg); color: var(--text); }
+header { display: flex; align-items: center; gap: 16px; padding: 12px 20px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+header h1 { font-size: 16px; margin: 0; }
+nav { display: flex; gap: 4px; flex-wrap: wrap; }
+nav button { background: none; border: 0; padding: 6px 10px; border-radius: 6px; color: var(--muted); cursor: pointer; font: inherit; }
+nav button.on { background: var(--chip); color: var(--text); font-weight: 600; }
+.spacer { flex: 1; }
+main { padding: 20px; max-width: 1300px; margin: 0 auto; }
+.panel { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 16px; margin-bottom: 16px; overflow-x: auto; }
+.panel h2 { font-size: 15px; margin: 0 0 12px; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px; }
+.card .k { color: var(--muted); font-size: 12px; }
+.card .v { font-size: 22px; font-weight: 650; margin-top: 4px; font-variant-numeric: tabular-nums; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; white-space: nowrap; }
+th { color: var(--muted); font-weight: 500; font-size: 12px; }
+td.num { font-variant-numeric: tabular-nums; text-align: right; }
+.badge { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--chip); }
+.active, .allow, .settled, .assigned { color: var(--ok); }
+.suspended, .released, .unassigned { color: var(--warn); }
+.revoked, .deny, .late_ignored { color: var(--bad); }
+.chip { display: inline-flex; align-items: center; gap: 4px; background: var(--chip); border-radius: 6px; padding: 1px 6px; margin: 1px 4px 1px 0; font-size: 12px; }
+.chip button { border: 0; background: none; color: var(--muted); cursor: pointer; padding: 0 2px; }
+.bar { width: 140px; height: 8px; background: var(--chip); border-radius: 4px; overflow: hidden; display: inline-block; vertical-align: middle; margin-right: 8px; }
+.bar i { display: block; height: 100%; background: var(--accent); }
+.bar i.hot { background: var(--bad); }
+button.act { font: inherit; font-size: 12px; padding: 3px 9px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); color: var(--text); cursor: pointer; margin-right: 4px; }
+button.act:hover { border-color: var(--accent); }
+button.danger { color: var(--bad); }
+button.primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+form.row { display: flex; gap: 8px; flex-wrap: wrap; align-items: end; }
+label { display: flex; flex-direction: column; gap: 3px; font-size: 12px; color: var(--muted); }
+input, select { font: inherit; padding: 5px 8px; border-radius: 6px; border: 1px solid var(--line); background: var(--bg); color: var(--text); min-width: 0; }
+.muted { color: var(--muted); }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; }
+#toast { position: fixed; bottom: 16px; right: 16px; max-width: 420px; padding: 10px 14px; border-radius: 8px; background: var(--text); color: var(--bg); display: none; }
+#login { max-width: 420px; margin: 80px auto; }
+.secret { padding: 10px; background: var(--chip); border-radius: 6px; word-break: break-all; margin: 8px 0; }
+.rule { padding: 6px 0; border-bottom: 1px solid var(--line); }
+@media (max-width: 640px) { main { padding: 12px; } header { padding: 10px 12px; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Agent Gateway</h1>
+  <nav id="nav"></nav>
+  <span class="spacer"></span>
+  <span id="who" class="muted"></span>
+</header>
+<main id="main"></main>
+<div id="toast"></div>
+<script>
+"use strict";
+// All data is rendered with textContent (via h()), never innerHTML, so agent/mandate names cannot inject markup.
+const TABS = ["Overview", "Agents", "Mandates", "Audit", "Models & Policy"];
+let tab = "Overview", summary = null, timer = null;
+const $ = (id) => document.getElementById(id);
+const store = { get: (k) => { try { return sessionStorage.getItem(k); } catch { return null; } },
+                set: (k, v) => { try { v === null ? sessionStorage.removeItem(k) : sessionStorage.setItem(k, v); } catch {} } };
+
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else if (v !== null && v !== undefined && v !== false) el.setAttribute(k, v === true ? "" : v);
+  }
+  for (const kid of kids.flat()) if (kid !== null && kid !== undefined && kid !== false)
+    el.append(kid instanceof Node ? kid : String(kid));
+  return el;
+}
+const toast = (msg) => { const t = $("toast"); t.textContent = msg; t.style.display = "block"; clearTimeout(t._t); t._t = setTimeout(() => t.style.display = "none", 4000); };
+const usd = (s) => s == null ? "—" : "$" + Number(s).toFixed(Math.abs(Number(s)) < 1 ? 4 : 2);
+const when = (s) => new Date(s).toLocaleString();
+const badge = (s) => h("span", { class: "badge " + s }, s);
+
+async function api(method, path, body) {
+  const r = await fetch(path, { method, headers: { "Authorization": "Bearer " + store.get("adminToken"), "Content-Type": "application/json" },
+                                body: body === undefined ? undefined : JSON.stringify(body) });
+  const data = await r.json().catch(() => ({}));
+  if (r.status === 401) { store.set("adminToken", null); render(); throw new Error("admin token rejected"); }
+  if (!r.ok) throw new Error((data.error && (data.error.code + ": " + data.error.message)) || ("HTTP " + r.status));
+  return data;
+}
+async function act(fn, ok) { try { await fn(); if (ok) toast(ok); await refresh(); } catch (e) { toast(e.message); } }
+
+function budgetCell(row) {
+  const limit = row.budget_limit_micros, used = row.spent_micros + row.reserved_micros;
+  const pct = limit ? Math.min(100, (used / limit) * 100) : 100;
+  return h("td", {}, h("span", { class: "bar", title: `${pct.toFixed(1)}% incl. reserved` }, h("i", { class: pct >= 90 ? "hot" : "", style: `width:${pct}%` })),
+           h("span", { class: "mono" }, `${usd(row.spent_usd)} / ${usd(row.budget_limit_usd)}`),
+           row.reserved_micros ? h("span", { class: "muted" }, ` (+${usd(row.reserved_usd)} reserved)`) : null);
+}
+
+// ------------------------------------------------------------------ pages
+function overview() {
+  const s = summary, spent = s.agents.reduce((a, x) => a + x.spent_micros, 0) / 1e6;
+  const by = (st) => s.agents.filter((a) => a.status === st).length;
+  return [
+    h("div", { class: "cards" },
+      [["Total spend (all agents)", usd(spent)], ["Agents active", by("active")], ["Suspended / revoked", `${by("suspended")} / ${by("revoked")}`],
+       ["Mandates", s.mandates.length], ["Allowed (24h)", s.last_24h.allowed], ["Denied (24h)", s.last_24h.denied]]
+        .map(([k, v]) => h("div", { class: "card" }, h("div", { class: "k" }, k), h("div", { class: "v" }, v)))),
+    h("div", { class: "panel" }, h("h2", {}, "Agents"), agentTable(false)),
+    h("div", { class: "panel" }, h("h2", {}, "Mandates"), mandateTable(false)),
+  ];
+}
+
+function agentTable(withActions) {
+  return h("table", {},
+    h("tr", {}, ["Agent", "Status", "Budget (spent / limit)", "Mandates", withActions ? "Actions" : null].filter(Boolean).map((c) => h("th", {}, c))),
+    summary.agents.map((a) => h("tr", {},
+      h("td", {}, h("b", {}, a.id), h("div", { class: "muted" }, a.name)),
+      h("td", {}, badge(a.status)),
+      budgetCell(a),
+      h("td", {}, a.mandates.length ? a.mandates.map((m) => h("span", { class: "chip" }, m)) : h("span", { class: "muted" }, "none")),
+      withActions ? h("td", {},
+        a.status === "active"
+          ? [h("button", { class: "act", onclick: () => confirm(`Suspend ${a.id}? Its next request will be denied.`) && act(() => api("PATCH", `/admin/agents/${a.id}`, { status: "suspended" }), `${a.id} suspended`) }, "Suspend"),
+             h("button", { class: "act danger", onclick: () => confirm(`Revoke ${a.id}? Its credential stops working until restored.`) && act(() => api("PATCH", `/admin/agents/${a.id}`, { status: "revoked" }), `${a.id} revoked`) }, "Revoke")]
+          : h("button", { class: "act", onclick: () => confirm(`Restore ${a.id} to active?`) && act(() => api("PATCH", `/admin/agents/${a.id}`, { status: "active" }), `${a.id} restored`) }, "Restore"),
+        h("button", { class: "act", onclick: () => { const v = prompt(`New lifetime budget for ${a.id} (USD). 0 withdraws it.`, a.budget_limit_usd); if (v !== null) act(() => api("PATCH", `/admin/agents/${a.id}`, { budget_usd: v.trim() }), "budget updated"); } }, "Budget"),
+        h("button", { class: "act", onclick: () => confirm(`Rotate token for ${a.id}? The old token stops working immediately.`) && issueToken(a.id) }, a.token_issued === false ? "Issue token" : "Rotate token"),
+      ) : null)));
+}
+
+async function issueToken(id) {
+  try {
+    const r = await api("POST", `/admin/agents/${id}/token`);
+    const box = h("div", { class: "panel" }, h("h2", {}, `Token for ${id} — shown once`),
+      h("div", { class: "secret mono" }, r.token),
+      h("button", { class: "act primary", onclick: () => navigator.clipboard.writeText(r.token).then(() => toast("copied")) }, "Copy"),
+      h("button", { class: "act", onclick: () => box.remove() }, "I have stored it — hide"),
+      h("p", { class: "muted" }, "Only a hash is stored. Configure the agent with:  LLM_BASE_URL=" + location.origin + "/m/<mandate>/v1  and this token as LLM_API_KEY."));
+    $("main").prepend(box);
+  } catch (e) { toast(e.message); }
+}
+
+function agentsPage() {
+  const f = h("form", { class: "row", onsubmit: (e) => { e.preventDefault(); const d = Object.fromEntries(new FormData(f));
+    act(async () => { await api("POST", "/admin/agents", { id: d.id.trim(), name: d.name.trim(), budget_usd: d.budget.trim() }); f.reset(); await issueToken(d.id.trim()); }, "agent created"); } },
+    h("label", {}, "ID (a-z, 0-9, -)", h("input", { name: "id", required: true, pattern: "[a-z0-9-]{1,64}" })),
+    h("label", {}, "Name", h("input", { name: "name", required: true })),
+    h("label", {}, "Budget USD", h("input", { name: "budget", required: true, value: "1.00", inputmode: "decimal" })),
+    h("button", { class: "act primary" }, "Create agent + token"));
+  return [h("div", { class: "panel" }, h("h2", {}, "Agents — kill switch"), agentTable(true)),
+          h("div", { class: "panel" }, h("h2", {}, "New agent"), f)];
+}
+
+function mandateTable(withActions) {
+  return h("table", {},
+    h("tr", {}, ["Mandate", "Status", "Budget (spent / limit)", "Allowed models", "Agents", withActions ? "Actions" : null].filter(Boolean).map((c) => h("th", {}, c))),
+    summary.mandates.map((m) => h("tr", {},
+      h("td", {}, h("b", {}, m.id), h("div", { class: "muted" }, m.name)),
+      h("td", {}, badge(m.status)),
+      budgetCell(m),
+      h("td", {}, m.allowed_models.length ? m.allowed_models.map((x) => h("span", { class: "chip" }, x)) : h("span", { class: "muted" }, "none")),
+      h("td", {}, m.agents.map((a) => h("span", { class: "chip" }, a, withActions ? h("button", { title: "unassign",
+          onclick: () => confirm(`Unassign ${a} from ${m.id}?`) && act(() => api("DELETE", `/admin/agents/${a}/mandates/${m.id}`), "unassigned") }, "×") : null)),
+        withActions ? assignSelect(m) : null),
+      withActions ? h("td", {},
+        m.status === "active"
+          ? h("button", { class: "act danger", onclick: () => confirm(`Suspend mandate ${m.id}? All its agents are denied under it.`) && act(() => api("PATCH", `/admin/mandates/${m.id}`, { status: "suspended" }), "mandate suspended") }, "Suspend")
+          : h("button", { class: "act", onclick: () => act(() => api("PATCH", `/admin/mandates/${m.id}`, { status: "active" }), "mandate restored") }, "Restore"),
+        h("button", { class: "act", onclick: () => { const v = prompt(`New budget for ${m.id} (USD). 0 withdraws it.`, m.budget_limit_usd); if (v !== null) act(() => api("PATCH", `/admin/mandates/${m.id}`, { budget_usd: v.trim() }), "budget updated"); } }, "Budget"),
+        h("button", { class: "act", onclick: () => { const v = prompt(`Allowed models (comma separated). Available: ${Object.keys(summary.models).join(", ")}`, m.allowed_models.join(", ")); if (v !== null) act(() => api("PATCH", `/admin/mandates/${m.id}`, { allowed_models: v.split(",").map((x) => x.trim()).filter(Boolean) }), "models updated"); } }, "Models"),
+      ) : null)));
+}
+
+function assignSelect(m) {
+  const options = summary.agents.filter((a) => !m.agents.includes(a.id));
+  if (!options.length) return null;
+  return h("select", { onchange: (e) => e.target.value && act(() => api("PUT", `/admin/agents/${e.target.value}/mandates/${m.id}`), "assigned") },
+    h("option", { value: "" }, "+ assign"), options.map((a) => h("option", { value: a.id }, a.id)));
+}
+
+function mandatesPage() {
+  const models = Object.keys(summary.models);
+  const f = h("form", { class: "row", onsubmit: (e) => { e.preventDefault(); const d = new FormData(f);
+    act(async () => { await api("POST", "/admin/mandates", { id: d.get("id").trim(), name: d.get("name").trim(), description: d.get("description").trim(),
+      budget_usd: d.get("budget").trim(), allowed_models: d.getAll("models") }); f.reset(); }, "mandate created"); } },
+    h("label", {}, "ID (a-z, 0-9, -)", h("input", { name: "id", required: true, pattern: "[a-z0-9-]{1,64}" })),
+    h("label", {}, "Name", h("input", { name: "name", required: true })),
+    h("label", {}, "Description", h("input", { name: "description" })),
+    h("label", {}, "Budget USD", h("input", { name: "budget", required: true, value: "5.00", inputmode: "decimal" })),
+    h("label", {}, "Allowed models", h("div", {}, models.map((x) => h("label", { style: "flex-direction:row;gap:4px;display:inline-flex;margin-right:8px" }, h("input", { type: "checkbox", name: "models", value: x }), x)))),
+    h("button", { class: "act primary" }, "Create mandate"));
+  return [h("div", { class: "panel" }, h("h2", {}, "Mandates"), mandateTable(true)),
+          h("div", { class: "panel" }, h("h2", {}, "New mandate"), f)];
+}
+
+async function auditPage() {
+  const q = JSON.parse(store.get("auditFilter") || "{}");
+  const f = h("form", { class: "row", onsubmit: (e) => { e.preventDefault(); store.set("auditFilter", JSON.stringify(Object.fromEntries(new FormData(f)))); render(); } },
+    h("label", {}, "Agent", h("select", { name: "agent" }, h("option", { value: "" }, "any"), summary.agents.map((a) => h("option", { value: a.id, selected: q.agent === a.id }, a.id)))),
+    h("label", {}, "Mandate", h("select", { name: "mandate" }, h("option", { value: "" }, "any"), summary.mandates.map((m) => h("option", { value: m.id, selected: q.mandate === m.id }, m.id)))),
+    h("label", {}, "Decision", h("select", { name: "decision" }, ["", "allow", "deny", "settled", "released", "late_ignored"].map((d) => h("option", { value: d, selected: q.decision === d }, d || "any")))),
+    h("label", {}, "Kind", h("select", { name: "kind" }, ["", "request", "settle", "admin"].map((d) => h("option", { value: d, selected: q.kind === d }, d || "any")))),
+    h("button", { class: "act primary" }, "Filter"));
+  const params = new URLSearchParams(Object.entries(q).filter(([, v]) => v)); params.set("limit", "200");
+  const rows = await api("GET", "/admin/audit?" + params);
+  return [h("div", { class: "panel" }, h("h2", {}, "Audit log"), f),
+    h("div", { class: "panel" }, h("table", {},
+      h("tr", {}, ["Time", "Kind", "Agent", "Mandate", "Model", "Decision", "Reason", "Reserved", "Cost", "Tokens in/out", "Request / detail"].map((c) => h("th", {}, c))),
+      rows.map((e) => h("tr", {},
+        h("td", {}, when(e.at)), h("td", {}, e.kind), h("td", {}, e.agent_id || "—"), h("td", {}, e.mandate_id || "—"), h("td", {}, e.model || "—"),
+        h("td", {}, badge(e.decision)), h("td", { class: "mono" }, e.reason_code || ""),
+        h("td", { class: "num" }, e.reserved_usd ? usd(e.reserved_usd) : ""), h("td", { class: "num", title: e.cost_source || "" }, e.cost_usd ? usd(e.cost_usd) : ""),
+        h("td", { class: "num" }, e.prompt_tokens != null ? `${e.prompt_tokens} / ${e.completion_tokens}` : ""),
+        h("td", { class: "mono muted", title: JSON.stringify(e.detail) }, (e.request_id || "").slice(0, 8), Object.keys(e.detail).length ? " " + JSON.stringify(e.detail).slice(0, 80) : ""))))),
+  ];
+}
+
+function modelsPage() {
+  return [
+    h("div", { class: "panel" }, h("h2", {}, "Models (view only — configured in config/litellm.yaml)"),
+      h("table", {}, h("tr", {}, ["Model", "Input $/1M tokens", "Output $/1M tokens"].map((c) => h("th", {}, c))),
+        Object.entries(summary.models).map(([m, p]) => h("tr", {}, h("td", {}, m), h("td", { class: "num" }, Number(p.input_usd_per_1m).toFixed(2)), h("td", { class: "num" }, Number(p.output_usd_per_1m).toFixed(2)))))),
+    h("div", { class: "panel" }, h("h2", {}, `Policy (view only — config/policy.toml) · version ${summary.policy.version}`),
+      h("p", { class: "muted" }, "Rules are checked top to bottom; the first match denies. Budgets are enforced separately and atomically."),
+      summary.policy.rules.map((r, i) => h("div", { class: "rule" }, h("b", {}, `${i + 1}. deny ${r.reason}`), "  when ",
+        h("span", { class: "mono" }, Object.entries(r.when).map(([k, v]) => `${k} = ${v}`).join(" and ")), h("div", { class: "muted" }, r.message || "")))),
+  ];
+}
+
+// ------------------------------------------------------------------ shell
+function loginPage() {
+  const f = h("form", { onsubmit: (e) => { e.preventDefault(); store.set("adminToken", new FormData(f).get("t").trim()); render(); } },
+    h("label", {}, "Admin token (ADMIN_TOKEN in .env)", h("input", { name: "t", type: "password", required: true, autofocus: true })),
+    h("p", {}, h("button", { class: "act primary" }, "Sign in")),
+    h("p", { class: "muted" }, "Kept in this browser tab's session storage only."));
+  return h("div", { id: "login", class: "panel" }, h("h2", {}, "Sign in"), f);
+}
+
+async function refresh() { summary = await api("GET", "/admin/summary"); await draw(); }
+
+async function draw() {
+  const pages = { "Overview": overview, "Agents": agentsPage, "Mandates": mandatesPage, "Audit": auditPage, "Models & Policy": modelsPage };
+  const content = await pages[tab]();
+  if (tab === "Agents" || tab === "Mandates") {
+    // keep a just-issued token box visible across refreshes
+    const keep = [...$("main").querySelectorAll(".panel")].filter((p) => p.querySelector(".secret"));
+    $("main").replaceChildren(...keep, ...[content].flat());
+  } else $("main").replaceChildren(...[content].flat());
+}
+
+async function render() {
+  clearInterval(timer);
+  $("nav").replaceChildren(); $("who").textContent = "";
+  if (!store.get("adminToken")) { $("main").replaceChildren(loginPage()); return; }
+  $("nav").replaceChildren(...TABS.map((t) => h("button", { class: t === tab ? "on" : "", onclick: () => { tab = t; store.set("tab", t); render(); } }, t)));
+  $("who").replaceChildren("admin · ", h("button", { class: "act", onclick: () => { store.set("adminToken", null); render(); } }, "Sign out"));
+  try { await refresh(); } catch (e) { toast(e.message); return; }
+  if (tab === "Overview") timer = setInterval(() => refresh().catch(() => {}), 10000);
+}
+
+tab = TABS.includes(store.get("tab")) ? store.get("tab") : "Overview";
+render();
+</script>
+</body>
+</html>

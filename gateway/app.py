@@ -123,7 +123,8 @@ def token_hash(token: str) -> bytes:
 
 def ledger_view(row) -> dict:
     d = dict(row)
-    d.pop("token_sha256", None)
+    if "token_sha256" in d:
+        d["token_issued"] = d.pop("token_sha256") is not None
     for k in ("budget_limit_micros", "spent_micros", "reserved_micros"):
         d[k.replace("_micros", "_usd")] = usd(d[k])
     return d
@@ -323,6 +324,16 @@ async def ready():
 
 
 app.include_router(admin)
+
+DASHBOARD = os.path.join(os.path.dirname(__file__), "dashboard.html")
+
+@app.get("/admin/ui", include_in_schema=False)
+async def dashboard():
+    """Static page; holds no data. It asks for the admin token and calls the admin API above."""
+    return FileResponse(DASHBOARD, headers={
+        "Content-Security-Policy": "default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; "
+                                   "frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        "X-Frame-Options": "DENY", "Referrer-Policy": "no-referrer", "Cache-Control": "no-store"})
 
 
 # ---------------------------------------------------------------------------- agent API

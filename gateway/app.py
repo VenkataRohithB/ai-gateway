@@ -52,6 +52,7 @@ class State:
     http: httpx.AsyncClient
     litellm_admin: httpx.AsyncClient  # master key; used only by the provider/model management routes
     prices: dict[str, dict] = {}   # model -> LiteLLM model_info (every price field)
+    model_keys: dict[str, str] = {}  # model -> provider key name (LiteLLM credential, or "env-<provider>")
     policy: Policy = Policy()
     inr_rate: Decimal = Decimal("85")
     inr_rate_updated: datetime | None = None
@@ -69,6 +70,14 @@ async def load_prices() -> None:
             prices[m["model_name"]] = info
     state.prices = prices
     log_event(event="prices_loaded", models=sorted(prices))
+    if LITELLM_MASTER_KEY:  # which key pays for each model (for the free/paid tag); needs the admin view
+        try:
+            r = await state.litellm_admin.get("/model/info")
+            r.raise_for_status()
+            state.model_keys = {d["model_name"]: (d.get("litellm_params") or {}).get("litellm_credential_name")
+                                or f"env-{(d.get('model_info') or {}).get('litellm_provider') or 'unknown'}" for d in r.json()["data"]}
+        except Exception as e:
+            log_event(logging.WARNING, event="model_keys_unavailable", error=type(e).__name__)
 
 async def load_policy() -> None:
     row = await state.pool.fetchrow("SELECT version, rules FROM policy_versions ORDER BY version DESC LIMIT 1")
@@ -478,7 +487,8 @@ async def list_models():
         for m in r["allowed_models"]:
             used.setdefault(m, []).append(r["id"])
     per_m = lambda v: None if v is None else str(Decimal(str(v)) * MICROS)
-    return [{"model": m, "provider": info.get("litellm_provider"),
+    known = await tiers()
+    return [{"model": m, "provider": info.get("litellm_provider"), **tier_view(state.model_keys.get(m), known),
              "input_usd_per_1m": per_m(info.get("input_cost_per_token")),
              "output_usd_per_1m": per_m(info.get("output_cost_per_token")),
              "max_output_tokens": info.get("max_output_tokens") or MAX_OUTPUT_FALLBACK,
@@ -550,6 +560,9 @@ async def list_providers():
                        "priced": d["model_name"] in state.prices, "input_usd_per_1m": per_m(info.get("input_cost_per_token")),
                        "output_usd_per_1m": per_m(info.get("output_cost_per_token")),
                        "mandates": mandates_using(d["model_name"], mandate_rows)})
+    known = await tiers()
+    for m in models:
+        m.update(tier_view(m["provider_key"] or f"env-{m['provider'] or 'unknown'}", known))
     keys = []
     for c in creds:
         values, cinfo = c.get("credential_values") or {}, c.get("credential_info") or {}
@@ -557,8 +570,14 @@ async def list_providers():
         keys.append({"name": c["credential_name"], "provider": provider, "label": PROVIDERS.get(provider, (provider,))[0],
                      "key_hint": values.get("api_key"),  # masked by LiteLLM, e.g. "sk-****wxyz"
                      "api_base": values.get("api_base"), "added_at": cinfo.get("added_at"),
-                     "models": [m["name"] for m in models if m["provider_key"] == c["credential_name"]]})
+                     "models": [m["name"] for m in models if m["provider_key"] == c["credential_name"]],
+                     "source": "console", **tier_view(c["credential_name"], known)})
     env_providers = sorted({m["provider"] for m in models if m["source"] == "config" and m["provider"]})
+    for prov in env_providers:  # keys that come from the .env file: shown so they can be tagged too
+        name = f"env-{prov}"
+        keys.append({"name": name, "provider": prov, "label": PROVIDERS.get(prov, (prov,))[0], "key_hint": None, "api_base": None,
+                     "added_at": None, "models": [m["name"] for m in models if m["source"] == "config" and m["provider"] == prov],
+                     "source": "env", **tier_view(name, known)})
     return {"enabled": True, "keys": keys, "models": models, "env_providers": env_providers,
             "provider_choices": [{"id": k, "label": v[0]} for k, v in PROVIDERS.items()]}
 
@@ -625,6 +644,49 @@ async def remove_model(name: str):
     await sync_gateway_key()
     await audit(state.pool, kind="admin", actor="admin", decision="model_removed", detail={"name": name})
     return {"name": name, "removed": True}
+
+async def tiers() -> dict[str, dict]:
+    return {r["key_name"]: dict(r) for r in await state.pool.fetch("SELECT * FROM provider_tiers")}
+
+def tier_view(key_name: str | None, known: dict) -> dict:
+    t = known.get(key_name) if key_name else None
+    return {"tier": t["tier"] if t else "unknown", "tier_source": t["source"] if t else None,
+            "tier_evidence": t["evidence"] if t else None, "tier_updated_at": t["updated_at"] if t else None}
+
+FREE_TIER_MARKERS = ("freetier", "free_tier")  # Gemini 429 quota ids, e.g. GenerateRequestsPerMinutePerProjectPerModel-FreeTier
+
+async def detect_tier(model: str, status: int, message: str) -> None:
+    """Tag the model's provider key as free tier when the provider's own quota error says so.
+    Never overrides a tier the admin set. Only the verdict is stored, never the message."""
+    key_name = state.model_keys.get(model)
+    if status != 429 or not key_name or not any(m in message.lower() for m in FREE_TIER_MARKERS):
+        return
+    changed = await state.pool.fetchval(
+        "INSERT INTO provider_tiers (key_name, tier, source, evidence) VALUES ($1, 'free', 'detected', $2) "
+        "ON CONFLICT (key_name) DO UPDATE SET tier='free', evidence=$2, updated_at=now() "
+        "WHERE provider_tiers.source = 'detected' AND provider_tiers.tier <> 'free' RETURNING 1",
+        key_name, f"{model} hit a free-tier quota (HTTP 429)")
+    if changed:
+        log_event(event="tier_detected", key=key_name, tier="free", model=model)
+
+class TierUpdate(_Strict):
+    tier: Literal["free", "paid", "auto"]   # auto = forget the admin choice, go back to detection
+
+@admin.put("/providers/{name}/tier")
+async def set_tier(name: str, body: TierUpdate):
+    if not re.match(SLUG, name):
+        raise GatewayError(400, "INVALID_REQUEST", "invalid key name")
+    async with state.pool.acquire() as c, c.transaction():
+        before = await c.fetchval("SELECT tier || ' (' || source || ')' FROM provider_tiers WHERE key_name=$1", name)
+        if body.tier == "auto":
+            await c.execute("DELETE FROM provider_tiers WHERE key_name=$1 AND source='admin'", name)
+        else:
+            await c.execute("INSERT INTO provider_tiers (key_name, tier, source, evidence) VALUES ($1, $2, 'admin', 'set in the console') "
+                            "ON CONFLICT (key_name) DO UPDATE SET tier=$2, source='admin', evidence='set in the console', updated_at=now()",
+                            name, body.tier)
+        await audit(c, kind="admin", actor="admin", decision="tier_set",
+                    detail={"changed": {"tier": {"before": before, "after": body.tier}}, "name": name})
+    return tier_view(name, await tiers())
 
 @app.get("/health/live")
 async def live():
@@ -931,6 +993,11 @@ async def forward(reservation_id: uuid.UUID, request_id: uuid.UUID, model: str, 
         pass
     log_event(logging.WARNING, event="upstream_error", request_id=str(request_id), model=model, status=r.status_code,
               message=upstream_msg[:200])
+    if r.status_code == 429:
+        try:
+            await detect_tier(model, 429, r.text)  # the full body: Gemini's quota id can sit past the logged excerpt
+        except Exception:
+            log.exception("tier detection failed")
     info = {"status": r.status_code, "source": "none"}
     if r.status_code in (408, 504):
         row = await db.settle(state.pool, reservation_id, "settled", None)

@@ -30,6 +30,7 @@ class Upstream:
         self.calls: list[httpx.Request] = []
         self.status, self.cost, self.exc, self.gate = 200, "0.000020", None, None
         self.by_model: dict[str, int] = {}  # model -> status to return for that model only
+        self.message = "upstream says no (internal-detail)"
 
     async def handler(self, request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health/liveliness":
@@ -46,7 +47,7 @@ class Upstream:
             raise self.exc
         status = self.by_model.get(json.loads(request.content)["model"], self.status)
         if status != 200:
-            return httpx.Response(status, json={"error": {"message": "upstream says no (internal-detail)"}})
+            return httpx.Response(status, json={"error": {"message": self.message}})
         return httpx.Response(200, json=COMPLETION, headers={"x-litellm-response-cost": self.cost} if self.cost else {})
 
     def models(self):
@@ -61,7 +62,7 @@ async def upstream():
 @pytest.fixture
 async def owner():
     conn = await asyncpg.connect(OWNER_DSN)
-    await conn.execute("TRUNCATE audit_events, reservations, agent_mandates, agents, mandates, usage, usage_monthly, policy_versions RESTART IDENTITY")
+    await conn.execute("TRUNCATE audit_events, reservations, agent_mandates, agents, mandates, usage, usage_monthly, policy_versions, provider_tiers RESTART IDENTITY")
     await conn.execute("UPDATE settings SET value='85' WHERE key='usd_inr_rate'")
     yield conn
     await conn.close()
@@ -70,6 +71,7 @@ async def owner():
 @pytest.fixture
 async def client(upstream, owner):
     gw.UPSTREAM_TRANSPORT = httpx.MockTransport(upstream.handler)
+    gw.state.model_keys = {}
     async with gw.lifespan(gw.app):
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=gw.app), base_url="http://gw") as c:
             yield c
@@ -513,6 +515,42 @@ async def test_fallback_model_must_pass_policy_and_be_reservable(client, upstrea
     assert r.status_code == 429 and upstream.models() == ["mock-model"]
 
 
+# --------------------------------------------------------------------------- free / paid tier
+
+GEMINI_FREE_429 = ('litellm.RateLimitError: GeminiException - {"error": {"code": 429, "status": "RESOURCE_EXHAUSTED", '
+                   '"details": [{"violations": [{"quotaMetric": "generativelanguage.googleapis.com/generate_content_free_tier_requests", '
+                   '"quotaId": "GenerateRequestsPerMinutePerProjectPerModel-FreeTier"}]}]}}')
+
+
+async def test_free_tier_is_detected_from_the_providers_quota_error(client, upstream, owner):
+    token = await make_agent(client, "agent-a", models=("mock-model", "mock-model-2"))
+    gw.state.model_keys = {"mock-model": "gemini-main", "mock-model-2": "other-key"}
+    upstream.by_model, upstream.message = {"mock-model": 429}, "rate limited"     # a 429 without a free-tier quota id
+    assert (await chat(client, token)).status_code == 200
+    assert await owner.fetchval("SELECT count(*) FROM provider_tiers") == 0       # no signal, no guess
+    upstream.message = GEMINI_FREE_429
+    assert (await chat(client, token)).status_code == 200                        # fallback answered meanwhile
+    row = await owner.fetchrow("SELECT * FROM provider_tiers")
+    assert (row["key_name"], row["tier"], row["source"]) == ("gemini-main", "free", "detected")
+    assert "FreeTier" not in row["evidence"]                                      # verdict stored, not the message
+    models = {m["model"]: m for m in await admin(client, "GET", "/admin/models", expect=200)}
+    assert models["mock-model"]["tier"] == "free" and models["mock-model-2"]["tier"] == "unknown"
+
+
+async def test_admin_tier_overrides_detection_and_auto_restores_it(client, upstream, owner):
+    token = await make_agent(client, "agent-a", models=("mock-model", "mock-model-2"))
+    gw.state.model_keys = {"mock-model": "gemini-main"}
+    assert (await admin(client, "PUT", "/admin/providers/gemini-main/tier", {"tier": "paid"}, 200))["tier"] == "paid"
+    upstream.by_model, upstream.message = {"mock-model": 429}, GEMINI_FREE_429
+    assert (await chat(client, token)).status_code == 200
+    assert await owner.fetchval("SELECT tier || '/' || source FROM provider_tiers") == "paid/admin"   # admin wins
+    assert (await admin(client, "PUT", "/admin/providers/gemini-main/tier", {"tier": "auto"}, 200))["tier"] == "unknown"
+    assert (await chat(client, token)).status_code == 200
+    assert await owner.fetchval("SELECT tier || '/' || source FROM provider_tiers") == "free/detected"
+    assert await owner.fetchval("SELECT count(*) FROM audit_events WHERE decision='tier_set'") == 2
+    assert (await client.put("/admin/providers/gemini-main/tier", headers=ADMIN, json={"tier": "gold"})).status_code == 400
+
+
 # --------------------------------------------------------------------------- estimate
 
 async def test_worst_rates_cover_cache_writes_tiers_and_reasoning():
@@ -574,7 +612,8 @@ async def test_admin_reporting_endpoints(client, upstream):
     assert o["agents"][0]["last_request_at"] is not None
     models = await admin(client, "GET", "/admin/models", expect=200)
     assert models[0] == {"model": "mock-model", "provider": None, "input_usd_per_1m": "1.000000", "output_usd_per_1m": "2.000000",
-                         "max_output_tokens": gw.MAX_OUTPUT_FALLBACK, "mandates": ["m1"]}
+                         "max_output_tokens": gw.MAX_OUTPUT_FALLBACK, "mandates": ["m1"], "tier": "unknown",
+                         "tier_source": None, "tier_evidence": None, "tier_updated_at": None}
     r = await client.post("/admin/mandates", headers=ADMIN, json={"id": "m2", "name": "x", "budget": "1",
                                                                   "allowed_models": ["mock-model", "mock-model"]})
     assert r.status_code == 400

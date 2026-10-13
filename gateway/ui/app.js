@@ -268,6 +268,9 @@ const STATUS_TONE = { active: "ok", suspended: "warn", revoked: "danger" };
 const titleCase = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const statusPill = (status) => h("span", { class: `pill ${STATUS_TONE[status] || ""}` }, titleCase(status));
 const OUTCOME = { ok: ["Answered", "ok"], denied: ["Blocked", "danger"], error: ["Failed", "warn"], timeout: ["Timed out", "warn"] };
+// Tier tag: a pill (scannable in tables) plus where the verdict came from, so nobody mistakes a guess for a fact.
+const TIER = { free: ["Free tier", "info"], paid: ["Paid", "ok"], unknown: ["Not detected yet", ""] };
+const tierPill = (t) => h("span", { class: `pill plain ${TIER[t]?.[1] || ""}` }, TIER[t]?.[0] || t);
 const outcomePill = (o) => h("span", { class: `pill ${OUTCOME[o]?.[1] || ""}` }, OUTCOME[o]?.[0] || o);
 
 function meter(v, large = false) {
@@ -666,7 +669,7 @@ const FIELD_TEXT = {
   rpm_limit: "Rate limit", allowed_models: "Models", default_max_tokens: "Default max tokens", fallback_enabled: "Fallback",
   usd_inr_rate: "USD→INR rate",
 };
-Object.assign(CHANGE_TEXT, { provider_key_added: "Provider key added", provider_key_removed: "Provider key removed",
+Object.assign(CHANGE_TEXT, { tier_set: "Key tier set", provider_key_added: "Provider key added", provider_key_removed: "Provider key removed",
   model_added: "Model added", model_removed: "Model removed" });
 function fieldValue(key, v) {
   if (v == null) return key === "rpm_limit" ? "none" : "—";
@@ -774,7 +777,7 @@ async function pageAgent(id) {
 }
 
 /** Usage records table. opts: { agent: show agent column, compact } */
-function usageTable(rows, { agent = true, mandate = true, compact = false } = {}) {
+function usageTable(rows, { agent = true, mandate = true, compact = false, tiers = {} } = {}) {
   const cols = [
     { label: "Time", render: (r) => h("span.num", when(r.at)) },
     agent && { label: "Agent", render: (r) => h("a", { href: `#/agents/${r.agent_id}` }, r.agent_id) },
@@ -789,7 +792,9 @@ function usageTable(rows, { agent = true, mandate = true, compact = false } = {}
     { label: "Result", render: (r) => h("div", outcomePill(r.outcome), r.reason_code && h("div.cell-sub", reasonText(r.reason_code))) },
     !compact && { label: "Tokens in / out", align: "r", render: (r) => (r.prompt_tokens == null ? h("span.faint", "—") : h("span.num", `${int(r.prompt_tokens)} / ${int(r.completion_tokens)}`)) },
     !compact && { label: "Held (estimate)", align: "r", render: (r) => h("span.num.faint", Number(r.reserved_usd) ? money(r.reserved_usd) : "—") },
-    { label: compact ? "Cost" : "Charged (actual)", align: "r", render: (r) => h("span.num", Number(r.cost_usd) ? money(r.cost_usd) : "—") },
+    { label: compact ? "Cost" : "Charged (actual)", align: "r", render: (r) => h("div",
+      h("span.num", Number(r.cost_usd) ? money(r.cost_usd) : "—"),
+      tiers[r.model_served] === "free" && Number(r.cost_usd) ? h("div.cell-sub", { title: "Charged at list price; a free-tier key pays $0" }, "free tier") : null) },
     !compact && { label: "Took", align: "r", render: (r) => h("span.num.muted", r.latency_ms == null ? "—" : r.latency_ms < 1000 ? `${r.latency_ms} ms` : `${(r.latency_ms / 1000).toFixed(1)} s`) },
   ].filter(Boolean);
   return table(cols, rows, { empty: emptyState("No calls yet", "Calls appear here as soon as the agent makes them.") });
@@ -981,7 +986,7 @@ async function pageUsage(q) {
   // the real cost from the tokens the provider reported. Showing both makes it obvious which one counts.
   const explain = callout("", h("strong", "Held vs charged. "), "Before each call the gateway holds the most it could cost (the estimate). " +
     "After the answer, it charges the real cost: the tokens the provider reported × the model's price, including cache discounts. Only the charged amount counts against budgets. " +
-    "Amounts use list prices, so on a free-tier key your real bill is $0.");
+    "Amounts use list prices; calls on a key tagged \"free tier\" cost you $0.");
   return [head, explain, tabs, tab === "monthly" ? await usageMonthly(q) : await usageRequests(q)];
 }
 
@@ -996,13 +1001,14 @@ async function usageRequests(q) {
     field("Result", select([["", "All results"], ["ok", "Answered"], ["denied", "Blocked"], ["error", "Failed"], ["timeout", "Timed out"]], filters.outcome, { onchange: (e) => setQuery(q, { outcome: e.target.value }) })),
     field("Model", select([["", "All models"], ...models.map((m) => [m.model, m.model])], filters.model, { onchange: (e) => setQuery(q, { model: e.target.value }) })),
     Object.values(filters).some(Boolean) && h("div.field", h("span.label", " "), h("button.btn.ghost", { type: "button", onclick: () => go("#/usage") }, "Clear filters")));
-  const holder = h("div", usageTable(rows));
+  const tiers = Object.fromEntries(models.map((m) => [m.model, m.tier]));
+  const holder = h("div", usageTable(rows, { tiers }));
   let last = rows.length ? rows[rows.length - 1].id : null;
   const more = h("button.btn", { type: "button", onclick: () => busy(more, async () => {
     const next = await api("GET", `/admin/usage?limit=50&before_id=${last}&${params}`);
     rows.push(...next);
     last = rows.length ? rows[rows.length - 1].id : null;
-    holder.replaceChildren(usageTable(rows));
+    holder.replaceChildren(usageTable(rows, { tiers }));
     if (next.length < 50) more.remove();
   }) }, "Load older calls");
   return card({ flush: true, body: [bar, holder], foot: rows.length === 50 && h("div.toolbar", more) });
@@ -1225,30 +1231,36 @@ async function pageProviders() {
       message: "Agents can no longer use it. It must not be on any mandate." }))) return;
     try { await api("DELETE", `/admin/models/${encodeURIComponent(m.name)}`); toast("Model removed."); refresh(); } catch (ex) { toast(ex.message, "error"); }
   };
-  const envNote = p.env_providers.length
-    ? callout("", h("strong", "Also in use: "), `${p.env_providers.join(", ")} key(s) from the .env file, for the models marked "config file". Those are changed in the files, not here.`)
-    : null;
+  const setTier = async (k, tier) => {
+    try { await api("PUT", `/admin/providers/${k.name}/tier`, { tier }); toast(tier === "auto" ? "Back to automatic detection." : `Tagged as ${TIER[tier][0].toLowerCase()}.`); }
+    catch (ex) { toast(ex.message, "error"); }
+    refresh();
+  };
+  const tierCell = (k) => h("div", tierPill(k.tier),
+    h("div.help", k.tier_source === "admin" ? "set by you" : k.tier_source === "detected" ? `detected ${when(k.tier_updated_at)}` : "waits for a provider signal"),
+    select([["auto", "Detect automatically"], ["free", "Set: free tier"], ["paid", "Set: paid"]], k.tier_source === "admin" ? k.tier : "auto",
+      { class: "select tier-select", "aria-label": `Tier for ${k.name}`, onchange: (e) => setTier(k, e.target.value) }));
   return [
     pageHead({ title: "Providers", sub: "Your AI company keys and the models agents may use.",
       actions: [h("button.btn", { type: "button", onclick: () => openAddModel(p) }, icon("plus"), "Add model"),
         h("button.btn.primary", { type: "button", onclick: () => openAddKey(p) }, icon("plus"), "Add key")] }),
     callout("", h("strong", "How keys are kept safe. "), "A key is sent once to LiteLLM, which encrypts it (AES-256-GCM) with a secret that exists only in the .env file. " +
       "It is never stored in the gateway's database, never logged, and can't be shown again, not even here. Only a few characters are shown (like sk****ar) so you can tell keys apart."),
-    card({ title: "Keys", hint: `${p.keys.length} added here`, flush: true, body: [
+    card({ title: "Keys", hint: "Free or paid: no AI company reports this for a key, so the gateway tags a key as free tier when the provider's own rate-limit error says so. Set it yourself to override.", flush: true, body:
       table([
-        { label: "Name", render: (k) => h("span.cell-title", k.name) },
+        { label: "Name", render: (k) => h("div", h("span.cell-title", k.name), k.source === "env" && h("div.help", "from the .env file")) },
         { label: "Provider", render: (k) => h("div", k.label, k.api_base && h("div.cell-sub", k.api_base)) },
-        { label: "Key", render: (k) => h("span.code", k.key_hint || "••••") },
+        { label: "Key", render: (k) => (k.key_hint ? h("span.code", k.key_hint) : h("span.faint", "in .env")) },
+        { label: "Tier", render: tierCell },
         { label: "Models", render: (k) => chips(k.models) },
-        { label: "Added", render: (k) => h("span.muted", k.added_at ? when(k.added_at) : "—") },
-        { label: "", align: "r", render: (k) => h("button.btn.sm.danger", { type: "button", onclick: () => removeKey(k) }, "Remove") },
-      ], p.keys, { empty: emptyState("No keys added here yet", "Add a key, then add the models it unlocks.",
-        h("button.btn.primary", { type: "button", onclick: () => openAddKey(p) }, icon("plus"), "Add key")) }),
-      envNote && h("div.card-body", envNote),
-    ] }),
+        { label: "", align: "r", render: (k) => (k.source === "console"
+          ? h("button.btn.sm.danger", { type: "button", onclick: () => removeKey(k) }, "Remove") : h("span.faint", "In files")) },
+      ], p.keys, { empty: emptyState("No keys yet", "Add a key, then add the models it unlocks.",
+        h("button.btn.primary", { type: "button", onclick: () => openAddKey(p) }, icon("plus"), "Add key")) }) }),
     card({ title: "Models", hint: "Agents can only use a model once it's on one of their mandates", flush: true, body: table([
       { label: "Model name", render: (m) => h("div", h("div.mono", m.name), h("div.cell-sub", m.provider_model)) },
       { label: "Key", render: (m) => (m.source === "config" ? h("span.pill.plain", "config file") : h("span.chip", m.provider_key)) },
+      { label: "Tier", render: (m) => tierPill(m.tier) },
       { label: "Price per 1M tokens", render: (m) => (m.priced ? h("span.num", `${money(m.input_usd_per_1m)} in · ${money(m.output_usd_per_1m)} out`) : h("span.pill.warn.plain", "No price")) },
       { label: "Used by", render: (m) => chips(m.mandates) },
       { label: "", align: "r", render: (m) => (m.source === "console"

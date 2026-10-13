@@ -250,8 +250,8 @@ The mandate's own fallback order can now be set on Mandates → ResearchOS devel
 1. Add the key to `.env` and pass it to the `litellm` service in `docker-compose.yml`.
 2. Add the model to `config/litellm.yaml` with `api_key: os.environ/NAME`. A model missing from LiteLLM's price
    table needs `input_cost_per_token` / `output_cost_per_token` there, or the gateway refuses it.
-3. `docker compose up -d --force-recreate litellm`, then `docker compose restart gateway` to reload prices.
-4. If the `gateway` LiteLLM key was created with a fixed model list, add the model to it (`scripts/litellm_api.py`).
+3. `docker compose up -d --force-recreate litellm`, then (after step 4) `docker compose restart gateway` to reload prices.
+4. Run `scripts/litellm-setup.sh`: it lets the gateway's LiteLLM key use every model in `config/litellm.yaml`.
 5. Add the model to mandates in the console.
 
 ## 13. Troubleshooting

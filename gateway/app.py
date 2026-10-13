@@ -36,7 +36,7 @@ MAX_BODY_BYTES = 2 * 1024 * 1024
 MAX_OUTPUT_FALLBACK = 16384  # output cap for a model whose price entry has no max_output_tokens
 SWEEP_EVERY, SWEEP_AFTER, CLEANUP_EVERY = 60, UPSTREAM_TIMEOUT + 300, 3600
 BUDGET_TIMEZONE = "Asia/Kolkata"  # must match SQL budget_period() in migrations/003_v3.sql
-RETRY_STATUSES = {429, 503}  # upstream answers that move on to the next fallback model
+RETRY_STATUSES = {404, 429, 503}  # model not available for this key / busy / overloaded: never billed, try the next model
 
 log = logging.getLogger("gateway")
 logging.basicConfig(level=getattr(logging, LOG_LEVEL, logging.INFO), format="%(message)s")

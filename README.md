@@ -182,7 +182,7 @@ Every agent and every mandate has a **monthly** budget in **USD or INR**. A requ
 
 ## 6. Fallback models
 
-A mandate's model list is ordered. If the requested model answers **429 (busy) or 503**, or can't be reached, the
+A mandate's model list is ordered. If the requested model answers **404 (not available for this key), 429 (busy) or 503**, or can't be reached, the
 gateway tries the **next models after it in the list**. Each attempt passes policy and gets its own budget hold at its
 own price; busy attempts cost nothing. Timeouts do **not** fall back (LiteLLM gives up at 240 s and agents at 300 s,
 so a second try would arrive too late). Fallback can be switched off per mandate. LiteLLM itself never retries.

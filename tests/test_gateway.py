@@ -464,6 +464,15 @@ async def test_busy_model_falls_back_to_next_in_mandate_order(client, upstream, 
     assert await owner.fetchval("SELECT count(*) FROM reservations WHERE client_request_id=$1", uuid.UUID(r.headers["x-request-id"])) == 3
 
 
+async def test_model_not_available_falls_back(client, upstream, owner):
+    """e.g. Gemini: 'This model is no longer available to new users' (404). Not billed; try the next model."""
+    token = await make_agent(client, "agent-a", models=("mock-model", "mock-model-2"))
+    upstream.by_model = {"mock-model": 404}
+    r = await chat(client, token)
+    assert r.status_code == 200 and r.headers["x-gateway-model"] == "mock-model-2"
+    assert tuple(await ledger(owner, "agents", "agent-a"))[:2] == (20, 0)
+
+
 async def test_fallback_starts_after_the_requested_model(client, upstream):
     token = await make_agent(client, "agent-a", models=("mock-model", "mock-model-2", "mock-model-3"))
     upstream.by_model = {"mock-model-2": 429}

@@ -788,7 +788,8 @@ function usageTable(rows, { agent = true, mandate = true, compact = false } = {}
     } },
     { label: "Result", render: (r) => h("div", outcomePill(r.outcome), r.reason_code && h("div.cell-sub", reasonText(r.reason_code))) },
     !compact && { label: "Tokens in / out", align: "r", render: (r) => (r.prompt_tokens == null ? h("span.faint", "—") : h("span.num", `${int(r.prompt_tokens)} / ${int(r.completion_tokens)}`)) },
-    { label: "Cost", align: "r", render: (r) => h("span.num", Number(r.cost_usd) ? money(r.cost_usd) : "—") },
+    !compact && { label: "Held (estimate)", align: "r", render: (r) => h("span.num.faint", Number(r.reserved_usd) ? money(r.reserved_usd) : "—") },
+    { label: compact ? "Cost" : "Charged (actual)", align: "r", render: (r) => h("span.num", Number(r.cost_usd) ? money(r.cost_usd) : "—") },
     !compact && { label: "Took", align: "r", render: (r) => h("span.num.muted", r.latency_ms == null ? "—" : r.latency_ms < 1000 ? `${r.latency_ms} ms` : `${(r.latency_ms / 1000).toFixed(1)} s`) },
   ].filter(Boolean);
   return table(cols, rows, { empty: emptyState("No calls yet", "Calls appear here as soon as the agent makes them.") });
@@ -976,7 +977,12 @@ async function pageUsage(q) {
     [["requests", "Calls"], ["monthly", "Monthly totals"]].map(([t, label]) =>
       h("button", { type: "button", role: "tab", "aria-selected": String(t === tab), onclick: () => setQuery(q, { tab: t === "requests" ? "" : t }) }, label)));
   const head = pageHead({ title: "Usage", sub: "Every call an agent made through the gateway. Raw calls are kept 90 days; monthly totals are kept forever." });
-  return [head, tabs, tab === "monthly" ? await usageMonthly(q) : await usageRequests(q)];
+  // Two money columns on purpose: "Held" is the worst case reserved before the call (never charged), "Charged" is
+  // the real cost from the tokens the provider reported. Showing both makes it obvious which one counts.
+  const explain = callout("", h("strong", "Held vs charged. "), "Before each call the gateway holds the most it could cost (the estimate). " +
+    "After the answer, it charges the real cost: the tokens the provider reported × the model's price, including cache discounts. Only the charged amount counts against budgets. " +
+    "Amounts use list prices, so on a free-tier key your real bill is $0.");
+  return [head, explain, tabs, tab === "monthly" ? await usageMonthly(q) : await usageRequests(q)];
 }
 
 async function usageRequests(q) {

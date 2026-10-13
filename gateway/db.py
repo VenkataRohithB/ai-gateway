@@ -20,7 +20,7 @@ AUDIT_COLUMNS = {"kind", "actor", "request_id", "agent_id", "mandate_id", "model
                  "policy_version", "reserved_micros", "cost_micros", "cost_source", "prompt_tokens",
                  "completion_tokens", "finish_reason", "upstream_status", "detail"}
 USAGE_COLUMNS = {"request_id", "agent_id", "mandate_id", "model_requested", "model_served", "outcome", "reason_code",
-                 "http_status", "attempts", "prompt_tokens", "completion_tokens", "cost_micros", "cost_source",
+                 "http_status", "attempts", "prompt_tokens", "completion_tokens", "cost_micros", "reserved_micros", "cost_source",
                  "latency_ms", "policy_version"}
 
 MONTH_SPENT = "CASE WHEN period = budget_period() THEN spent_micros ELSE 0 END"

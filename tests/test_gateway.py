@@ -132,6 +132,7 @@ async def test_allowed_request_is_forwarded_attributed_and_charged(client, upstr
     u = await usage_row(owner, rid)
     assert (u["outcome"], u["agent_id"], u["mandate_id"], u["model_served"], u["attempts"]) == ("ok", "agent-a", "m1", "mock-model", 1)
     assert (u["cost_micros"], u["cost_source"], u["prompt_tokens"], u["completion_tokens"]) == (20, "litellm_header", 10, 5)
+    assert u["reserved_micros"] == estimate()                     # the hold is recorded next to the real charge
     for table, id_ in (("agents", "agent-a"), ("mandates", "m1")):
         assert tuple(await ledger(owner, table, id_))[:2] == (20, 0)
     month = await owner.fetchrow("SELECT * FROM usage_monthly")
@@ -460,6 +461,8 @@ async def test_busy_model_falls_back_to_next_in_mandate_order(client, upstream, 
     assert upstream.models() == ["mock-model", "mock-model-2", "mock-model-3"]
     u = await usage_row(owner, r.headers["x-request-id"])
     assert (u["model_requested"], u["model_served"], u["attempts"], u["cost_micros"]) == ("mock-model", "mock-model-3", 3, 20)
+    holds = await owner.fetchval("SELECT sum(amount_micros) FROM reservations WHERE client_request_id=$1", uuid.UUID(r.headers["x-request-id"]))
+    assert u["reserved_micros"] == holds > 0                       # one hold per attempt, summed
     assert tuple(await ledger(owner, "agents", "agent-a"))[:2] == (20, 0)  # busy attempts cost nothing
     assert await owner.fetchval("SELECT count(*) FROM reservations WHERE client_request_id=$1", uuid.UUID(r.headers["x-request-id"])) == 3
 

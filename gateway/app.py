@@ -361,6 +361,8 @@ async def unassign(agent_id: str, mandate_id: str):
 def usage_view(r) -> dict:
     d = dict(r)
     d["cost_usd"] = amount(d.pop("cost_micros"))
+    if "reserved_micros" in d:
+        d["reserved_usd"] = amount(d.pop("reserved_micros"))
     return d
 
 @admin.get("/usage")
@@ -836,7 +838,7 @@ async def chat_completions(mandate_id: str, request: Request, authorization: str
     # 4. Attempt the requested model, then (if enabled) the models after it in the mandate's list.
     allowed = list(ctx["allowed_models"])
     chain = [model] + (allowed[allowed.index(model) + 1:] if ctx["fallback_enabled"] else [])
-    total_cost, attempts, last = 0, 0, None
+    total_cost, total_held, attempts, last = 0, 0, 0, None
     for i, m in enumerate(chain):
         if i:  # every fallback model passes policy on its own
             if not policy.evaluate(facts_for(ctx, agent_id, mandate_id, m))["allow"]:
@@ -868,12 +870,14 @@ async def chat_completions(mandate_id: str, request: Request, authorization: str
             await deny(402, "AGENT_BUDGET_EXCEEDED" if failed == "agent" else "MANDATE_BUDGET_EXCEEDED",
                        f"{failed} budget cannot cover this request (worst-case estimate {amount(est)} USD)", model)
         attempts += 1
+        total_held += est
         kind, result, info = await forward(reservation_id, request_id, m, out_bytes, est)
         total_cost += info.get("cost", 0)
         log_event(event="attempt", request_id=rid, agent=agent_id, mandate=mandate_id, model=m, attempt=attempts,
                   result=kind, status=info.get("status"), reserved=est, cost=info.get("cost", 0), source=info.get("source"))
         if kind == "ok":
             await finish("ok", 200, model_requested=model, model_served=m, attempts=attempts, cost_micros=total_cost,
+                         reserved_micros=total_held,
                          cost_source=info["source"], prompt_tokens=info.get("prompt_tokens"),
                          completion_tokens=info.get("completion_tokens"))
             return JSONResponse(result, headers={"x-request-id": rid, "x-gateway-model": m})
@@ -882,7 +886,7 @@ async def chat_completions(mandate_id: str, request: Request, authorization: str
             break
     result, info = last
     await finish(info.get("outcome", "error"), result.status, model_requested=model, attempts=attempts,
-                 cost_micros=total_cost, cost_source=info.get("source"), reason_code=result.code)
+                 cost_micros=total_cost, reserved_micros=total_held, cost_source=info.get("source"), reason_code=result.code)
     result.body["error"]["request_id"] = rid
     raise result
 

@@ -171,9 +171,11 @@ def ledger_view(row) -> dict:
     rate = state.inr_rate if d["budget_currency"] == "INR" else Decimal(1)
     spent, reserved, limit = d.pop("month_spent_micros"), d.pop("reserved_micros"), d.pop("budget_limit_micros")
     d.pop("spent_micros", None)
+    pct = lambda micros: round(float(micros * rate / limit * 100), 1) if limit else (100.0 if micros else 0.0)
     d.update(budget=amount(limit), spent=amount(spent * rate), reserved=amount(reserved * rate),
+             remaining=amount(max(Decimal(0), limit - (spent + reserved) * rate)),
              spent_usd=amount(spent), reserved_usd=amount(reserved),
-             used_pct=round(float((spent + reserved) * rate / limit * 100), 1) if limit else (100.0 if spent + reserved else 0.0))
+             spent_pct=pct(spent), held_pct=pct(reserved), used_pct=pct(spent + reserved))
     return d
 
 
@@ -394,22 +396,85 @@ async def usage_daily(days: int = Query(30, ge=1, le=90), agent: str | None = No
         "FROM generate_series((now() AT TIME ZONE 'Asia/Kolkata')::date - ($1 - 1), (now() AT TIME ZONE 'Asia/Kolkata')::date, interval '1 day') d "
         "LEFT JOIN usage u ON (u.at AT TIME ZONE 'Asia/Kolkata')::date = d::date "
         "AND ($2::text IS NULL OR u.agent_id=$2) AND ($3::text IS NULL OR u.mandate_id=$3) GROUP BY d ORDER BY d", days, agent, mandate)
-    return [usage_view(r) for r in rows]
+    return {"days": [usage_view(r) for r in rows],
+            "totals": {"cost_usd": amount(sum(r["cost_micros"] for r in rows)), "requests": sum(r["requests"] for r in rows),
+                       "denied": sum(r["denied"] for r in rows)}}
 
 @admin.get("/usage/monthly")
 async def usage_monthly(month: str | None = Query(None, pattern=r"^\d{4}-\d{2}$"), agent: str | None = None,
-                        mandate: str | None = None):
-    """Monthly totals (kept forever) per agent x mandate x model. Default: the current budget month."""
+                        mandate: str | None = None, by: Literal["agent", "mandate", "model"] = "agent"):
+    """Monthly totals (kept forever), grouped by agent, mandate or model, with each row's share of the cost.
+    Default: the current budget month."""
     months = [r["month"].strftime("%Y-%m") for r in
               await state.pool.fetch("SELECT DISTINCT month FROM usage_monthly ORDER BY month DESC")]
     current = (await state.pool.fetchval("SELECT budget_period()")).strftime("%Y-%m")
     month = month or current
+    column = {"agent": "agent_id", "mandate": "mandate_id", "model": "model"}[by]  # whitelisted, never user text
     rows = await state.pool.fetch(
-        "SELECT agent_id, mandate_id, model, requests, prompt_tokens, completion_tokens, cost_micros FROM usage_monthly "
+        f"SELECT {column} AS key, sum(requests)::bigint AS requests, sum(prompt_tokens)::bigint AS prompt_tokens, "
+        "sum(completion_tokens)::bigint AS completion_tokens, sum(cost_micros)::bigint AS cost_micros FROM usage_monthly "
         "WHERE month = to_date($1, 'YYYY-MM') AND ($2::text IS NULL OR agent_id=$2) AND ($3::text IS NULL OR mandate_id=$3) "
-        "ORDER BY cost_micros DESC", month, agent, mandate)
-    return {"month": month, "current_month": current, "months": sorted(set(months) | {current}, reverse=True),
-            "rows": [usage_view(r) for r in rows]}
+        f"GROUP BY {column} ORDER BY cost_micros DESC, key", month, agent, mandate)
+    total_cost = sum(r["cost_micros"] for r in rows)
+    return {"month": month, "current_month": current, "months": sorted(set(months) | {current}, reverse=True), "by": by,
+            "rows": [{**usage_view(r), "share_pct": round(r["cost_micros"] / total_cost * 100, 1) if total_cost else 0.0} for r in rows],
+            "totals": {"requests": sum(r["requests"] for r in rows), "prompt_tokens": sum(r["prompt_tokens"] for r in rows),
+                       "completion_tokens": sum(r["completion_tokens"] for r in rows), "cost_usd": amount(total_cost)}}
+
+# Gate steps, in the order a request meets them; every deny reason maps to exactly one step.
+GATE_STEPS = [
+    ("identity", "Identity", {"UNAUTHORIZED", "AGENT_REVOKED", "AGENT_INACTIVE"}),
+    ("request", "Request check", {"FIELD_NOT_ALLOWED", "INVALID_REQUEST", "INVALID_JSON", "CONTENT_NOT_ALLOWED",
+                                  "TOOL_NOT_ALLOWED", "STREAMING_NOT_SUPPORTED", "REQUEST_TOO_LARGE"}),
+    ("mandate", "Mandate", {"MANDATE_NOT_ASSIGNED", "MANDATE_INACTIVE"}),
+    ("model", "Model", {"MODEL_NOT_ALLOWED"}),
+    ("policy", "Your policy rules", None),  # None = every other reason code (custom rules)
+    ("rate_limit", "Rate limit", {"AGENT_RATE_LIMITED"}),
+    ("budget", "Budget", {"AGENT_BUDGET_EXCEEDED", "MANDATE_BUDGET_EXCEEDED"}),
+]
+
+def gate_step(reason: str | None) -> str:
+    return next((step for step, _, codes in GATE_STEPS if codes and reason in codes), "policy")
+
+def money_text(value: str, currency: str = "USD") -> str:
+    """Human amount for sentences the API writes (e.g. "₹120.40", "$0.0616")."""
+    v = Decimal(value)
+    places = 2 if v == 0 or v >= 1 else 4 if v >= Decimal("0.01") else 6
+    return f"{'₹' if currency == 'INR' else '$'}{v:,.{places}f}"
+
+def attention(agents: list[dict], mandates: list[dict], charged_without_answer: dict) -> list[dict]:
+    """Things an admin should look at, most severe first. severity: danger | warn | info."""
+    items = []
+    add = lambda severity, title, detail, link: items.append({"severity": severity, "title": title, "detail": detail, "link": link})
+    for a in agents:
+        link = f"#/agents/{a['id']}"
+        if a["status"] != "active":
+            add("danger" if a["status"] == "revoked" else "warn", f"{a['name']} is {a['status']}", "All its requests are blocked.", link)
+        elif a["used_pct"] >= 100:
+            add("danger", f"{a['name']} has used its whole monthly budget",
+                "New requests are blocked until the budget is raised or the month resets.", link)
+        elif a["used_pct"] >= 80:
+            add("warn", f"{a['name']} has used {round(a['used_pct'])}% of its budget",
+                f"{money_text(a['spent'], a['budget_currency'])} of {money_text(a['budget'], a['budget_currency'])}", link)
+        if a["status"] == "active" and not a["token_issued"]:
+            add("info", f"{a['name']} has no access token", "Issue one so the agent can make calls.", link)
+        if a["status"] == "active" and not a["mandates"]:
+            add("info", f"{a['name']} isn't assigned to any mandate", "It can't make calls until it is.", link)
+    for m in mandates:
+        link = f"#/mandates/{m['id']}"
+        if m["status"] != "active":
+            add("warn", f"Mandate {m['name']} is suspended", "Every agent's requests under it are blocked.", link)
+        elif m["used_pct"] >= 100:
+            add("danger", f"Mandate {m['name']} has used its whole monthly budget", "All its agents are blocked.", link)
+        elif m["used_pct"] >= 80:
+            add("warn", f"Mandate {m['name']} has used {round(m['used_pct'])}% of its budget",
+                f"{money_text(m['spent'], m['budget_currency'])} of {money_text(m['budget'], m['budget_currency'])}", link)
+    if n := charged_without_answer["count"]:
+        add("warn", f"{n} model call{'s were' if n > 1 else ' was'} charged without an answer this month",
+            f"Timed out or abandoned, so the reserved amount was charged: {money_text(charged_without_answer['cost_usd'])}.",
+            "#/usage?outcome=timeout")
+    order = {"danger": 0, "warn": 1, "info": 2}
+    return sorted(items, key=lambda i: order[i["severity"]])
 
 @admin.get("/overview")
 async def overview():
@@ -420,15 +485,32 @@ async def overview():
         "SELECT count(*) FILTER (WHERE outcome='ok') AS ok, count(*) FILTER (WHERE outcome='denied') AS denied, "
         "count(*) FILTER (WHERE outcome IN ('error','timeout')) AS failed, coalesce(sum(cost_micros), 0) AS cost_micros "
         "FROM usage WHERE (at AT TIME ZONE 'Asia/Kolkata')::date = (now() AT TIME ZONE 'Asia/Kolkata')::date")
+    denied_by_reason = await state.pool.fetch(
+        "SELECT reason_code, count(*) AS n FROM usage WHERE outcome='denied' "
+        "AND (at AT TIME ZONE 'Asia/Kolkata')::date = (now() AT TIME ZONE 'Asia/Kolkata')::date GROUP BY reason_code")
+    bad_tokens = await state.pool.fetchval(
+        "SELECT coalesce((SELECT count FROM auth_failures WHERE day = (now() AT TIME ZONE 'Asia/Kolkata')::date), 0)")
+    counts = {step: 0 for step, _, _ in GATE_STEPS}
+    for r in denied_by_reason:
+        counts[gate_step(r["reason_code"])] += r["n"]
+    counts["identity"] += bad_tokens
     timeouts = await state.pool.fetchrow(
         "SELECT count(*) AS n, coalesce(sum(cost_micros), 0) AS cost_micros FROM usage "
         "WHERE outcome IN ('timeout', 'error') AND cost_micros > 0 AND at >= (budget_period()::timestamp AT TIME ZONE 'Asia/Kolkata')")
+    charged_without_answer = {"count": timeouts["n"], "cost_usd": amount(timeouts["cost_micros"])}
+    agents, mandates = await list_agents(), await list_mandates()
     return {"month": month["month"].strftime("%Y-%m"), "month_cost_usd": amount(month["cost_micros"]),
-            "month_requests": month["requests"],
-            "today": {"ok": today["ok"], "denied": today["denied"], "failed": today["failed"], "cost_usd": amount(today["cost_micros"])},
-            "charged_without_answer": {"count": timeouts["n"], "cost_usd": amount(timeouts["cost_micros"])},
+            "month_cost_inr": amount(month["cost_micros"] * state.inr_rate), "month_requests": month["requests"],
+            "today": {"ok": today["ok"], "denied": today["denied"] + bad_tokens, "failed": today["failed"],
+                      "cost_usd": amount(today["cost_micros"]),
+                      "blocked_by_step": [{"step": step, "label": label, "count": counts[step]} for step, label, _ in GATE_STEPS]},
+            "charged_without_answer": charged_without_answer,
+            "counts": {"agents_active": sum(a["status"] == "active" for a in agents), "agents_total": len(agents),
+                       "mandates_active": sum(m["status"] == "active" for m in mandates), "mandates_total": len(mandates)},
+            "attention": attention(agents, mandates, charged_without_answer),
+            "top_agents": sorted(agents, key=lambda a: (-Decimal(a["spent_usd"]), a["id"]))[:6],
             "usd_inr_rate": str(state.inr_rate), "policy_version": state.policy.version,
-            "agents": await list_agents(), "mandates": await list_mandates()}
+            "agents": agents, "mandates": mandates}
 
 @admin.get("/audit")
 async def get_audit(agent: str | None = None, mandate: str | None = None, limit: int = Query(100, ge=1, le=1000)):
@@ -861,9 +943,12 @@ async def chat_completions(mandate_id: str, request: Request, authorization: str
     agent_id = None
     if scheme.lower() == "bearer" and token.startswith("gw_"):
         agent_id = await state.pool.fetchval("SELECT id FROM agents WHERE token_sha256=$1", token_hash(token))
-    if not agent_id:  # not recorded (unauthenticated callers could flood the usage table)
+    if not agent_id:  # not written to usage (anyone could flood it); only a bounded per-day counter
         log_event(logging.WARNING, event="auth_failed", request_id=rid, mandate=mandate_id,
                   client=request.client.host if request.client else None)
+        await state.pool.execute(
+            "INSERT INTO auth_failures (day, count) VALUES ((now() AT TIME ZONE 'Asia/Kolkata')::date, 1) "
+            "ON CONFLICT (day) DO UPDATE SET count = auth_failures.count + 1")
         raise GatewayError(401, "UNAUTHORIZED", "missing or invalid agent token", request_id=rid)
     policy = state.policy  # one policy version for the whole request
 

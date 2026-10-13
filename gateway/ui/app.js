@@ -274,19 +274,16 @@ const tierPill = (t) => h("span", { class: `pill plain ${TIER[t]?.[1] || ""}` },
 const outcomePill = (o) => h("span", { class: `pill ${OUTCOME[o]?.[1] || ""}` }, OUTCOME[o]?.[0] || o);
 
 function meter(v, large = false) {
-  const budget = Number(v.budget), spent = Number(v.spent), held = Number(v.reserved);
-  const pct = budget > 0 ? (spent / budget) * 100 : spent > 0 ? 100 : 0;
-  const holdPct = budget > 0 ? (held / budget) * 100 : 0;
   const level = v.used_pct >= 100 ? "danger" : v.used_pct >= 80 ? "warn" : "";
   const fill = h("div.meter-fill");
-  fill.style.width = `${Math.min(100, pct)}%`;
-  const hold = h("div.meter-hold", { title: held > 0 ? `${money(held, v.budget_currency)} held for calls in progress` : null });
-  hold.style.width = `${Math.max(0, Math.min(100 - Math.min(100, pct), holdPct))}%`;
+  fill.style.width = `${Math.min(100, v.spent_pct)}%`;
+  const hold = h("div.meter-hold", { title: Number(v.reserved) > 0 ? `${money(v.reserved, v.budget_currency)} held for calls in progress` : null });
+  hold.style.width = `${Math.max(0, Math.min(100 - Math.min(100, v.spent_pct), v.held_pct))}%`;
   return h("div", { class: `meter ${level}${large ? " lg" : ""}` },
     h("div.meter-track", { role: "img", "aria-label": `${Math.round(v.used_pct)}% of budget used` }, fill, hold),
     h("div.meter-label",
-      h("span", h("strong", money(spent, v.budget_currency)), ` of ${money(budget, v.budget_currency)}`),
-      h("span", budget > 0 ? `${Math.round(v.used_pct)}%` : "No budget")));
+      h("span", h("strong", money(v.spent, v.budget_currency)), ` of ${money(v.budget, v.budget_currency)}`),
+      h("span", Number(v.budget) > 0 ? `${Math.round(v.used_pct)}%` : "No budget")));
 }
 
 function chips(items, { lead = false, arrows = false, text = false } = {}) {
@@ -361,14 +358,12 @@ function barChart(points, label) {
 }
 
 function dailyChartCard(daily, title = "Daily spend", hint = "Last 30 days, India time") {
-  const total = daily.reduce((s, d) => s + Number(d.cost_usd), 0);
-  const calls = daily.reduce((s, d) => s + d.requests, 0);
-  const blocked = daily.reduce((s, d) => s + d.denied, 0);
-  const points = daily.map((d) => ({ day: d.day, value: Number(d.cost_usd),
+  const t = daily.totals;
+  const points = daily.days.map((d) => ({ day: d.day, value: Number(d.cost_usd),
     title: `${dateOnly.format(new Date(`${d.day}T00:00:00`))}: ${money(d.cost_usd)} · ${d.requests} calls · ${d.denied} blocked` }));
   return card({ title, hint, body: [
-    barChart(points, `${title}: ${money(total)} over ${daily.length} days`),
-    h("div.chart-legend", h("span", `${money(total)} spent · ${int(calls)} sent to a model · ${int(blocked)} blocked`), h("span", "Hover a bar for the day")),
+    barChart(points, `${title}: ${money(t.cost_usd)} over ${daily.days.length} days`),
+    h("div.chart-legend", h("span", `${money(t.cost_usd)} spent · ${int(t.requests)} sent to a model · ${int(t.denied)} blocked`), h("span", "Hover a bar for the day")),
   ] });
 }
 
@@ -496,46 +491,26 @@ function kpi(label, value, foot) {
   return h("section.card.kpi", h("div.label", label), h("div.value", value), foot && h("div.foot", foot));
 }
 
-function attentionItems(o) {
-  const items = [];
-  const add = (level, t, s, href) => items.push({ level, t, s, href });
-  for (const a of o.agents) {
-    if (a.status !== "active") add(a.status === "revoked" ? "danger" : "warn", `${a.name} is ${a.status}`, "All its requests are blocked.", `#/agents/${a.id}`);
-    else if (a.used_pct >= 100) add("danger", `${a.name} has used its whole monthly budget`, "New requests are blocked until the budget is raised or the month resets.", `#/agents/${a.id}`);
-    else if (a.used_pct >= 80) add("warn", `${a.name} has used ${Math.round(a.used_pct)}% of its budget`, `${money(a.spent, a.budget_currency)} of ${money(a.budget, a.budget_currency)}`, `#/agents/${a.id}`);
-    if (a.status === "active" && !a.token_issued) add("info", `${a.name} has no access token`, "Issue one so the agent can make calls.", `#/agents/${a.id}`);
-    if (a.status === "active" && !a.mandates.length) add("info", `${a.name} isn't assigned to any mandate`, "It can't make calls until it is.", `#/agents/${a.id}`);
-  }
-  for (const m of o.mandates) {
-    if (m.status !== "active") add("warn", `Mandate ${m.name} is suspended`, "Every agent's requests under it are blocked.", `#/mandates/${m.id}`);
-    else if (m.used_pct >= 100) add("danger", `Mandate ${m.name} has used its whole monthly budget`, "All its agents are blocked.", `#/mandates/${m.id}`);
-    else if (m.used_pct >= 80) add("warn", `Mandate ${m.name} has used ${Math.round(m.used_pct)}% of its budget`, `${money(m.spent, m.budget_currency)} of ${money(m.budget, m.budget_currency)}`, `#/mandates/${m.id}`);
-  }
-  const c = o.charged_without_answer;
-  if (c.count) add("warn", `${c.count} model call${c.count > 1 ? "s were" : " was"} charged without an answer this month`,
-    `Timed out or abandoned, so the reserved amount was charged: ${money(c.cost_usd)}.`, "#/usage?outcome=timeout");
-  return items;
-}
-
 async function pageOverview() {
   const [o, daily] = await Promise.all([api("GET", "/admin/overview"), api("GET", "/admin/usage/daily?days=30")]);
-  const rate = Number(o.usd_inr_rate);
-  const activeAgents = o.agents.filter((a) => a.status === "active").length;
-  const items = attentionItems(o);
-  const top = [...o.agents].sort((a, b) => Number(b.spent_usd) - Number(a.spent_usd)).slice(0, 6);
+  const c = o.counts;
   return [
     pageHead({ title: "Overview", sub: `${monthName(o.month)} budget month · budgets reset on ${nextReset(o.month)} (India time)` }),
     h("div.kpis",
-      kpi("Spent this month", money(o.month_cost_usd), `≈ ${money(Number(o.month_cost_usd) * rate, "INR")} at ₹${rate} per $1`),
+      kpi("Spent this month", money(o.month_cost_usd), `≈ ${money(o.month_cost_inr, "INR")} at ₹${o.usd_inr_rate} per $1`),
       kpi("Charged calls this month", int(o.month_requests), `${int(o.today.ok)} answered today`),
       kpi("Blocked today", int(o.today.denied), o.today.failed ? `${int(o.today.failed)} failed today` : "Stopped before reaching a model"),
-      kpi("Active agents", `${activeAgents} of ${o.agents.length}`, `${o.mandates.filter((m) => m.status === "active").length} of ${o.mandates.length} mandates active`)),
+      kpi("Active agents", `${c.agents_active} of ${c.agents_total}`, `${c.mandates_active} of ${c.mandates_total} mandates active`)),
     h("div.grid-2",
-      dailyChartCard(daily),
-      card({ title: "Needs attention", hint: items.length ? `${items.length} item${items.length > 1 ? "s" : ""}` : null, flush: true,
-        body: items.length
-          ? h("div.list", items.map((it) => h("div.list-item", h("span", { class: `dot ${it.level}` }),
-            h("div", h("div.t", it.t), h("div.s", it.s)), h("a.btn.sm", { href: it.href }, "Open"))))
+      h("div.stack",
+        dailyChartCard(daily),
+        card({ title: "Blocked today, by step", hint: "Each blocked call is counted at the gate step that stopped it. None of them reached a model.", flush: true,
+          body: h("ol.gate-steps", o.today.blocked_by_step.map((st, i) => h("li", { class: st.count ? "hit" : "" },
+            h("span.gate-n", String(i + 1)), h("span.gate-label", st.label), h("span.num.gate-count", int(st.count))))) })),
+      card({ title: "Needs attention", hint: o.attention.length ? `${o.attention.length} item${o.attention.length > 1 ? "s" : ""}` : null, flush: true,
+        body: o.attention.length
+          ? h("div.list", o.attention.map((it) => h("div.list-item", h("span", { class: `dot ${it.severity}` }),
+            h("div", h("div.t", it.title), h("div.s", it.detail)), h("a.btn.sm", { href: it.link }, "Open"))))
           : emptyState("All clear", "No agent or mandate needs attention.") })),
     card({ title: "Agents by spend this month", actions: h("a.btn.sm", { href: "#/agents" }, "All agents", icon("arrow")), flush: true,
       body: table([
@@ -543,7 +518,7 @@ async function pageOverview() {
         { label: "Status", render: (a) => statusPill(a.status) },
         { label: "This month", render: (a) => meter(a) },
         { label: "Last call", render: (a) => h("span.muted", ago(a.last_request_at)) },
-      ], top, { onRow: (a) => go(`#/agents/${a.id}`), empty: emptyState("No agents yet", "Create an agent to get started.", h("a.btn.primary", { href: "#/agents" }, "Go to agents")) }) }),
+      ], o.top_agents, { onRow: (a) => go(`#/agents/${a.id}`), empty: emptyState("No agents yet", "Create an agent to get started.", h("a.btn.primary", { href: "#/agents" }, "Go to agents")) }) }),
   ];
 }
 
@@ -625,12 +600,11 @@ function showToken(agentId, token, mandateIds) {
 function budgetCard(kind, v, rate) {
   const month = currentMonth();
   const body = h("div.form");
-  const remaining = Math.max(0, Number(v.budget) - Number(v.spent) - Number(v.reserved));
   const view = () => body.replaceChildren(...[
     h("div.big-number", h("strong", money(v.spent, v.budget_currency)), h("span.muted", `spent of ${money(v.budget, v.budget_currency)} this month`)),
     meter(v, true),
     h("div.facts",
-      h("div.fact", h("div.k", "Remaining"), h("div.v", money(remaining, v.budget_currency))),
+      h("div.fact", h("div.k", "Remaining"), h("div.v", money(v.remaining, v.budget_currency))),
       h("div.fact", h("div.k", "Held for calls in progress"), h("div.v", money(v.reserved, v.budget_currency))),
       h("div.fact", h("div.k", "Resets on"), h("div.v", nextReset(month)))),
     v.budget_currency === "INR" && h("div.help", `Spend is billed in USD (${money(v.spent_usd)}) and converted at ₹${rate} per $1. Change the rate in Settings.`),
@@ -1016,23 +990,16 @@ async function usageRequests(q) {
 
 async function usageMonthly(q) {
   const by = ["agent", "mandate", "model"].includes(q.get("by")) ? q.get("by") : "agent";
-  const data = await api("GET", `/admin/usage/monthly${q.get("month") ? `?month=${q.get("month")}` : ""}`);
-  const key = { agent: "agent_id", mandate: "mandate_id", model: "model" }[by];
-  const groups = {};
-  for (const r of data.rows) {
-    const g = groups[r[key]] ||= { name: r[key], requests: 0, prompt: 0, completion: 0, cost: 0 };
-    g.requests += r.requests; g.prompt += r.prompt_tokens; g.completion += r.completion_tokens; g.cost += Number(r.cost_usd);
-  }
-  const rows = Object.values(groups).sort((a, b) => b.cost - a.cost);
-  const total = rows.reduce((t, r) => ({ requests: t.requests + r.requests, prompt: t.prompt + r.prompt, completion: t.completion + r.completion, cost: t.cost + r.cost }),
-    { requests: 0, prompt: 0, completion: 0, cost: 0 });
-  const href = { agent: (n) => `#/agents/${n}`, mandate: (n) => `#/mandates/${n}`, model: null }[by];
+  const params = new URLSearchParams({ by, ...(q.get("month") ? { month: q.get("month") } : {}) });
+  const data = await api("GET", `/admin/usage/monthly?${params}`);
+  const href = { agent: (k) => `#/agents/${k}`, mandate: (k) => `#/mandates/${k}`, model: null }[by];
   const share = (r) => {
     const track = h("div.meter-track"), fill = h("div.meter-fill");
-    fill.style.width = `${total.cost ? (r.cost / total.cost) * 100 : 0}%`;
+    fill.style.width = `${r.share_pct}%`;
     track.append(fill);
-    return h("div.meter", track);
+    return h("div.meter", { title: `${r.share_pct}% of the month's cost` }, track);
   };
+  const t = data.totals;
   return card({ flush: true, body: [
     h("div.toolbar",
       field("Month", select(data.months.map((m) => [m, monthName(m) + (m === data.current_month ? " (current)" : "")]), data.month,
@@ -1040,15 +1007,15 @@ async function usageMonthly(q) {
       h("div.field", h("span.label", "Group by"), segmented([["agent", "Agent"], ["mandate", "Mandate"], ["model", "Model"]], by,
         (v) => setQuery(q, { by: v === "agent" ? "" : v }), "Group by"))),
     table([
-      { label: titleCase(by), render: (r) => (href ? h("a.mono", { href: href(r.name) }, r.name) : h("span.mono", r.name)) },
+      { label: titleCase(by), render: (r) => (href ? h("a.mono", { href: href(r.key) }, r.key) : h("span.mono", r.key)) },
       { label: "Model calls", align: "r", render: (r) => h("span.num", int(r.requests)) },
-      { label: "Input tokens", align: "r", render: (r) => h("span.num", int(r.prompt)) },
-      { label: "Output tokens", align: "r", render: (r) => h("span.num", int(r.completion)) },
-      { label: "Cost", align: "r", render: (r) => h("span.num", money(r.cost)) },
+      { label: "Input tokens", align: "r", render: (r) => h("span.num", int(r.prompt_tokens)) },
+      { label: "Output tokens", align: "r", render: (r) => h("span.num", int(r.completion_tokens)) },
+      { label: "Cost", align: "r", render: (r) => h("span.num", money(r.cost_usd)) },
       { label: "Share of cost", render: share },
-    ], rows, {
+    ], data.rows, {
       empty: emptyState(`Nothing recorded for ${monthName(data.month)}`),
-      foot: ["Total", int(total.requests), int(total.prompt), int(total.completion), money(total.cost), ""],
+      foot: ["Total", int(t.requests), int(t.prompt_tokens), int(t.completion_tokens), money(t.cost_usd), ""],
     }),
   ] });
 }

@@ -62,7 +62,7 @@ async def upstream():
 @pytest.fixture
 async def owner():
     conn = await asyncpg.connect(OWNER_DSN)
-    await conn.execute("TRUNCATE audit_events, reservations, agent_mandates, agents, mandates, usage, usage_monthly, policy_versions, provider_tiers RESTART IDENTITY")
+    await conn.execute("TRUNCATE audit_events, reservations, agent_mandates, agents, mandates, usage, usage_monthly, policy_versions, provider_tiers, auth_failures RESTART IDENTITY")
     await conn.execute("UPDATE settings SET value='85' WHERE key='usd_inr_rate'")
     yield conn
     await conn.close()
@@ -604,12 +604,18 @@ async def test_admin_reporting_endpoints(client, upstream):
     assert [r["outcome"] for r in rows] == ["denied", "ok"] and rows[1]["cost_usd"] == "0.000020"
     assert len(await admin(client, "GET", f"/admin/usage?before_id={rows[0]['id']}", expect=200)) == 1
     daily = await admin(client, "GET", "/admin/usage/daily?days=7", expect=200)
-    assert len(daily) == 7 and daily[-1]["requests"] == 1 and daily[-1]["denied"] == 1 and daily[-1]["cost_usd"] == "0.000020"
+    assert len(daily["days"]) == 7 and daily["days"][-1]["requests"] == 1 and daily["days"][-1]["denied"] == 1
+    assert daily["totals"] == {"cost_usd": "0.000020", "requests": 1, "denied": 1}
     monthly = await admin(client, "GET", "/admin/usage/monthly", expect=200)
-    assert monthly["month"] == monthly["current_month"] and monthly["rows"][0]["requests"] == 1
+    assert monthly["month"] == monthly["current_month"] and monthly["by"] == "agent"
+    assert monthly["rows"] == [{"key": "agent-a", "requests": 1, "prompt_tokens": 10, "completion_tokens": 5,
+                                "cost_usd": "0.000020", "share_pct": 100.0}]
+    assert monthly["totals"] == {"requests": 1, "prompt_tokens": 10, "completion_tokens": 5, "cost_usd": "0.000020"}
     o = await admin(client, "GET", "/admin/overview", expect=200)
-    assert o["month_cost_usd"] == "0.000020" and o["today"] == {"ok": 1, "denied": 1, "failed": 0, "cost_usd": "0.000020"}
-    assert o["agents"][0]["last_request_at"] is not None
+    assert o["month_cost_usd"] == "0.000020" and o["month_cost_inr"] == "0.001700"            # at the 85 INR/USD test rate
+    assert {k: o["today"][k] for k in ("ok", "denied", "failed", "cost_usd")} == {"ok": 1, "denied": 1, "failed": 0, "cost_usd": "0.000020"}
+    assert o["counts"] == {"agents_active": 1, "agents_total": 1, "mandates_active": 1, "mandates_total": 1}
+    assert o["top_agents"][0]["id"] == "agent-a" and o["agents"][0]["last_request_at"] is not None
     models = await admin(client, "GET", "/admin/models", expect=200)
     assert models[0] == {"model": "mock-model", "provider": None, "input_usd_per_1m": "1.000000", "output_usd_per_1m": "2.000000",
                          "max_output_tokens": gw.MAX_OUTPUT_FALLBACK, "mandates": ["m1"], "tier": "unknown",
@@ -618,6 +624,45 @@ async def test_admin_reporting_endpoints(client, upstream):
                                                                   "allowed_models": ["mock-model", "mock-model"]})
     assert r.status_code == 400
     assert (await client.post("/admin/agents", headers=ADMIN, json={"id": "agent-a", "name": "dup", "budget": "1"})).status_code == 409
+
+
+async def test_monthly_totals_grouped_by_model_with_shares(client, upstream):
+    token = await make_agent(client, "agent-a", models=("mock-model", "mock-model-2"))
+    await chat(client, token)
+    upstream.cost = "0.000060"
+    await chat(client, token, body={**BODY, "model": "mock-model-2"})
+    m = await admin(client, "GET", "/admin/usage/monthly?by=model", expect=200)
+    assert [(r["key"], r["cost_usd"], r["share_pct"]) for r in m["rows"]] == [("mock-model-2", "0.000060", 75.0), ("mock-model", "0.000020", 25.0)]
+    assert (await client.get("/admin/usage/monthly?by=secret", headers=ADMIN)).status_code == 400
+
+
+async def test_blocked_calls_counted_per_gate_step(client, upstream):
+    token = await make_agent(client, "agent-a")
+    await client.post("/m/m1/v1/chat/completions", json=BODY, headers={"Authorization": "Bearer gw_wrong"})   # identity
+    await chat(client, token, body={**BODY, "api_key": "x"})                                                # request
+    await chat(client, token, mandate="nope")                                                               # mandate
+    await chat(client, token, body={**BODY, "model": "mock-model-2"})                                       # model
+    await admin(client, "PUT", "/admin/policy", {"rules": [{"reason": "NO_A", "when": {"agent.id": "agent-a"}}]}, 200)
+    await chat(client, token)                                                                               # policy
+    await admin(client, "PUT", "/admin/policy", {"rules": []}, 200)
+    await admin(client, "PATCH", "/admin/agents/agent-a", {"budget": "0"}, 200)
+    await chat(client, token)                                                                               # budget
+    o = await admin(client, "GET", "/admin/overview", expect=200)
+    steps = {s["step"]: s["count"] for s in o["today"]["blocked_by_step"]}
+    assert steps == {"identity": 1, "request": 1, "mandate": 1, "model": 1, "policy": 1, "rate_limit": 0, "budget": 1}
+    assert [s["step"] for s in o["today"]["blocked_by_step"]][0] == "identity" and o["today"]["denied"] == 6
+    assert upstream.calls == []
+
+
+async def test_attention_list_and_budget_fields(client, upstream):
+    await make_agent(client, "agent-a", agent_budget="1")
+    await admin(client, "POST", "/admin/agents", {"id": "agent-b", "name": "B", "budget": "1"}, 201)   # no token, no mandate
+    await admin(client, "PATCH", "/admin/agents/agent-a", {"status": "revoked"}, 200)
+    items = (await admin(client, "GET", "/admin/overview", expect=200))["attention"]
+    assert [(i["severity"], i["link"]) for i in items] == [("danger", "#/agents/agent-a"), ("info", "#/agents/agent-b"), ("info", "#/agents/agent-b")]
+    assert items[0]["title"] == "agent-a is revoked"
+    a = await admin(client, "GET", "/admin/agents/agent-b", expect=200)
+    assert (a["remaining"], a["spent_pct"], a["held_pct"], a["used_pct"]) == ("1.000000", 0.0, 0.0, 0.0)
 
 
 # --------------------------------------------------------------------------- admin + audit security

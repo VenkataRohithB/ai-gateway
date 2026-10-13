@@ -24,6 +24,7 @@ from policy import BUILTIN, CUSTOM_FACTS, Policy
 DATABASE_URL = os.environ["DATABASE_URL"]
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000")
 LITELLM_GATEWAY_KEY = os.environ["LITELLM_GATEWAY_KEY"]
+LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")  # only for the Providers page (keys + models in LiteLLM)
 ADMIN_TOKEN = os.environ["ADMIN_TOKEN"].encode()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 USAGE_RETENTION_DAYS = int(os.environ.get("USAGE_RETENTION_DAYS", "90"))
@@ -49,6 +50,7 @@ def log_event(level: int = logging.INFO, **fields) -> None:
 class State:
     pool: asyncpg.Pool
     http: httpx.AsyncClient
+    litellm_admin: httpx.AsyncClient  # master key; used only by the provider/model management routes
     prices: dict[str, dict] = {}   # model -> LiteLLM model_info (every price field)
     policy: Policy = Policy()
     inr_rate: Decimal = Decimal("85")
@@ -83,6 +85,8 @@ async def lifespan(app: FastAPI):
     state.http = httpx.AsyncClient(base_url=LITELLM_URL, transport=UPSTREAM_TRANSPORT,
                                    timeout=httpx.Timeout(UPSTREAM_TIMEOUT, connect=5),
                                    headers={"Authorization": f"Bearer {LITELLM_GATEWAY_KEY}"})
+    state.litellm_admin = httpx.AsyncClient(base_url=LITELLM_URL, transport=UPSTREAM_TRANSPORT, timeout=60,
+                                            headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"})
     await load_policy()   # an invalid stored policy refuses to start
     await load_settings()
     try:
@@ -94,6 +98,7 @@ async def lifespan(app: FastAPI):
     yield
     sweeper.cancel()
     await state.http.aclose()
+    await state.litellm_admin.aclose()
     await state.pool.close()
 
 async def sweep_forever() -> None:
@@ -476,6 +481,148 @@ async def list_models():
              "output_usd_per_1m": per_m(info.get("output_cost_per_token")),
              "max_output_tokens": info.get("max_output_tokens") or MAX_OUTPUT_FALLBACK,
              "mandates": used.get(m, [])} for m, info in sorted(state.prices.items())]
+
+# ---------------------------------------------------------------------------- providers (keys + models)
+# Provider keys are stored by LiteLLM in its own database, encrypted with LITELLM_SALT_KEY, which only LiteLLM
+# has. LiteLLM's API never returns a stored key unmasked, so neither does this API. Keys never touch the
+# gateway's database or logs; the audit trail records only the key's name and provider.
+PROVIDERS = {  # console choice -> (label, LiteLLM model prefix)
+    "gemini": ("Google Gemini", "gemini"), "openai": ("OpenAI", "openai"), "anthropic": ("Anthropic", "anthropic"),
+    "mistral": ("Mistral", "mistral"), "deepseek": ("DeepSeek", "deepseek"), "openrouter": ("OpenRouter", "openrouter"),
+    "openai_compatible": ("OpenAI-compatible (custom URL)", "openai"),
+}
+MODEL_ALIAS = r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$"
+
+class ProviderKeyCreate(_Strict):
+    name: str = Field(pattern=SLUG)
+    provider: Literal["gemini", "openai", "anthropic", "mistral", "deepseek", "openrouter", "openai_compatible"]
+    api_key: str = Field(min_length=8, max_length=4096)
+    api_base: str | None = Field(default=None, pattern=r"^https?://[^\s]{1,500}$")
+
+class ModelCreate(_Strict):
+    name: str = Field(pattern=MODEL_ALIAS)                          # what agents and mandates use
+    provider_key: str = Field(pattern=SLUG)
+    provider_model: str = Field(pattern=r"^[A-Za-z0-9][A-Za-z0-9._:/@-]{0,199}$")  # the provider's own model id
+    input_usd_per_1m: Decimal | None = Field(default=None, ge=0, le=100_000)
+    output_usd_per_1m: Decimal | None = Field(default=None, ge=0, le=100_000)
+
+async def litellm_call(method: str, path: str, body: dict | None = None) -> dict:
+    if not LITELLM_MASTER_KEY:
+        raise GatewayError(503, "PROVIDERS_DISABLED", "provider management needs LITELLM_MASTER_KEY in the gateway's environment")
+    try:
+        r = await state.litellm_admin.request(method, path, json=body)
+    except httpx.TransportError:
+        raise GatewayError(503, "UPSTREAM_UNAVAILABLE", "LiteLLM is not reachable")
+    if r.status_code >= 400:  # never echo LiteLLM's body: it could contain request values
+        log_event(logging.WARNING, event="litellm_admin_error", path=path.split("?")[0], status=r.status_code)
+        if r.status_code == 409:
+            raise GatewayError(409, "ALREADY_EXISTS", "that name is already used")
+        raise GatewayError(502, "LITELLM_ERROR", f"LiteLLM refused the change (HTTP {r.status_code}); see gateway logs")
+    return r.json() if r.content else {}
+
+async def sync_gateway_key() -> None:
+    """Let the gateway's LiteLLM key use every configured model, then reload prices."""
+    models = sorted(m["id"] for m in (await litellm_call("GET", "/v1/models"))["data"])
+    await litellm_call("POST", "/key/update", {"key": LITELLM_GATEWAY_KEY, "models": models})
+    await load_prices()
+
+async def provider_state() -> tuple[list[dict], list[dict]]:
+    creds = (await litellm_call("GET", "/credentials")).get("credentials", [])
+    deployments = (await litellm_call("GET", "/model/info")).get("data", [])
+    return creds, deployments
+
+def mandates_using(model: str, rows) -> list[str]:
+    return [r["id"] for r in rows if model in r["allowed_models"]]
+
+@admin.get("/providers")
+async def list_providers():
+    creds, deployments = await provider_state()
+    mandate_rows = await state.pool.fetch("SELECT id, allowed_models FROM mandates ORDER BY id")
+    models = []
+    for d in deployments:
+        lp, mi = d.get("litellm_params") or {}, d.get("model_info") or {}
+        info = state.prices.get(d["model_name"]) or {}
+        per_m = lambda v: None if v is None else str(Decimal(str(v)) * MICROS)
+        models.append({"name": d["model_name"], "provider_model": lp.get("model"), "provider_key": lp.get("litellm_credential_name"),
+                       "provider": mi.get("litellm_provider"), "source": "console" if mi.get("db_model") else "config",
+                       "priced": d["model_name"] in state.prices, "input_usd_per_1m": per_m(info.get("input_cost_per_token")),
+                       "output_usd_per_1m": per_m(info.get("output_cost_per_token")),
+                       "mandates": mandates_using(d["model_name"], mandate_rows)})
+    keys = []
+    for c in creds:
+        values, cinfo = c.get("credential_values") or {}, c.get("credential_info") or {}
+        provider = cinfo.get("gateway_provider")
+        keys.append({"name": c["credential_name"], "provider": provider, "label": PROVIDERS.get(provider, (provider,))[0],
+                     "key_hint": values.get("api_key"),  # masked by LiteLLM, e.g. "sk-****wxyz"
+                     "api_base": values.get("api_base"), "added_at": cinfo.get("added_at"),
+                     "models": [m["name"] for m in models if m["provider_key"] == c["credential_name"]]})
+    env_providers = sorted({m["provider"] for m in models if m["source"] == "config" and m["provider"]})
+    return {"enabled": True, "keys": keys, "models": models, "env_providers": env_providers,
+            "provider_choices": [{"id": k, "label": v[0]} for k, v in PROVIDERS.items()]}
+
+@admin.post("/providers", status_code=201)
+async def add_provider_key(body: ProviderKeyCreate):
+    if body.provider == "openai_compatible" and not body.api_base:
+        raise GatewayError(400, "INVALID_REQUEST", "an OpenAI-compatible provider needs its base URL")
+    values = {"api_key": body.api_key.strip(), **({"api_base": body.api_base} if body.api_base else {})}
+    await litellm_call("POST", "/credentials", {"credential_name": body.name, "credential_values": values,
+                       "credential_info": {"gateway_provider": body.provider, "added_at": datetime.now().astimezone().isoformat()}})
+    await audit(state.pool, kind="admin", actor="admin", decision="provider_key_added",
+                detail={"name": body.name, "provider": body.provider})
+    return {"name": body.name, "provider": body.provider}
+
+@admin.delete("/providers/{name}")
+async def remove_provider_key(name: str):
+    creds, deployments = await provider_state()
+    if not any(c["credential_name"] == name for c in creds):
+        raise GatewayError(404, "NOT_FOUND", f"provider key {name} not found")
+    if used := [d["model_name"] for d in deployments if (d.get("litellm_params") or {}).get("litellm_credential_name") == name]:
+        raise GatewayError(409, "IN_USE", f"remove these models first: {', '.join(used)}")
+    await litellm_call("DELETE", f"/credentials/{name}")
+    await audit(state.pool, kind="admin", actor="admin", decision="provider_key_removed", detail={"name": name})
+    return {"name": name, "removed": True}
+
+@admin.post("/models", status_code=201)
+async def add_model(body: ModelCreate):
+    creds, deployments = await provider_state()
+    cred = next((c for c in creds if c["credential_name"] == body.provider_key), None)
+    if not cred:
+        raise GatewayError(404, "NOT_FOUND", f"provider key {body.provider_key} not found")
+    if any(d["model_name"] == body.name for d in deployments):
+        raise GatewayError(409, "ALREADY_EXISTS", f"a model named {body.name} already exists")
+    if (body.input_usd_per_1m is None) != (body.output_usd_per_1m is None):
+        raise GatewayError(400, "INVALID_REQUEST", "give both prices or neither")
+    prefix = PROVIDERS.get((cred.get("credential_info") or {}).get("gateway_provider"), ("", "openai"))[1]
+    params = {"model": f"{prefix}/{body.provider_model}", "litellm_credential_name": body.provider_key}
+    if body.input_usd_per_1m is not None:
+        params |= {"input_cost_per_token": float(body.input_usd_per_1m / MICROS),
+                   "output_cost_per_token": float(body.output_usd_per_1m / MICROS)}
+    created = await litellm_call("POST", "/model/new", {"model_name": body.name, "litellm_params": params,
+                                                         "model_info": {"created_via": "gateway-console"}})
+    await sync_gateway_key()
+    if body.name not in state.prices:  # unpriced models can't be budgeted: undo and ask for prices
+        if model_id := (created.get("model_info") or {}).get("id") or created.get("model_id"):
+            await litellm_call("POST", "/model/delete", {"id": model_id})
+            await sync_gateway_key()
+        raise GatewayError(400, "PRICE_UNKNOWN", f"LiteLLM has no price for {params['model']}; enter its input and output price per 1M tokens")
+    await audit(state.pool, kind="admin", actor="admin", decision="model_added",
+                detail={"name": body.name, "provider_model": params["model"], "provider_key": body.provider_key})
+    return {"name": body.name, "provider_model": params["model"]}
+
+@admin.delete("/models/{name}")
+async def remove_model(name: str):
+    _, deployments = await provider_state()
+    d = next((d for d in deployments if d["model_name"] == name), None)
+    if not d:
+        raise GatewayError(404, "NOT_FOUND", f"model {name} not found")
+    if not (d.get("model_info") or {}).get("db_model"):
+        raise GatewayError(400, "CONFIG_MODEL", "this model is defined in config/litellm.yaml; remove it there")
+    if used := mandates_using(name, await state.pool.fetch("SELECT id, allowed_models FROM mandates")):
+        raise GatewayError(409, "IN_USE", f"remove it from these mandates first: {', '.join(used)}")
+    await litellm_call("POST", "/model/delete", {"id": d["model_info"]["id"]})
+    await sync_gateway_key()
+    await audit(state.pool, kind="admin", actor="admin", decision="model_removed", detail={"name": name})
+    return {"name": name, "removed": True}
 
 @app.get("/health/live")
 async def live():

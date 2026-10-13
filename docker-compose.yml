@@ -68,11 +68,14 @@ services:
 
   gateway:
     image: ai-agent-gateway:local
-    # Explicit env list: the gateway never sees the master key, salt key, provider keys or owner password.
+    # Explicit env list: the gateway never sees the salt key, provider keys or owner password.
     environment:
       DATABASE_URL: postgresql://gateway_app:${GATEWAY_APP_PASSWORD}@db:5432/gateway
       LITELLM_URL: http://litellm:4000
       LITELLM_GATEWAY_KEY: ${LITELLM_GATEWAY_KEY:?set in .env}
+      # Only for the console's Providers page (add/remove provider keys and models in LiteLLM).
+      # LiteLLM never returns stored keys unmasked, and the gateway never gets LITELLM_SALT_KEY.
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?set in .env}
       ADMIN_TOKEN: ${ADMIN_TOKEN:?set in .env}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}               # DEBUG shows every step of every request (no content)
       USAGE_RETENTION_DAYS: ${USAGE_RETENTION_DAYS:-90}

@@ -64,6 +64,7 @@ const ICONS = {
   lock: "M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z",
   empty: "M4 13h4l2 3h4l2-3h4M4 13l3-8h10l3 8v6H4z",
   check: "M5 12l5 5 9-10",
+  providers: "M14.5 9.5a3.5 3.5 0 1 1-1 2.5L4 21.5V18h3v-3h3l1-1M17 7h.01",
 };
 
 function icon(name) {
@@ -384,7 +385,7 @@ function errorCard(e, retry) {
 
 // ------------------------------------------------------------------ shell, routing, sign-in
 const NAV = [
-  ["overview", "Overview"], ["agents", "Agents"], ["mandates", "Mandates"], ["usage", "Usage"],
+  ["overview", "Overview"], ["agents", "Agents"], ["mandates", "Mandates"], ["providers", "Providers"], ["usage", "Usage"],
   ["policy", "Policy"], ["activity", "Activity"], ["settings", "Settings"],
 ];
 const root = () => document.getElementById("app");
@@ -393,11 +394,11 @@ let renderSeq = 0;
 function shell() {
   const nav = h("nav.nav", { "aria-label": "Main" },
     h("div.nav-label", "Manage"),
-    NAV.slice(0, 3).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)),
+    NAV.slice(0, 4).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)),
     h("div.nav-label", "Monitor"),
-    NAV.slice(3, 5).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)),
+    NAV.slice(4, 6).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)),
     h("div.nav-label", "System"),
-    NAV.slice(5).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)));
+    NAV.slice(6).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)));
   return h("div.shell",
     h("aside.side",
       h("div.brand", h("div.brand-mark", icon("gate")), h("div", h("div.brand-name", "Agent Gateway"), h("div.brand-sub", "Admin console"))),
@@ -444,6 +445,7 @@ const ROUTES = [
   [/^\/agents\/([a-z0-9-]+)$/, (m) => pageAgent(m[1])],
   [/^\/mandates$/, () => pageMandates()],
   [/^\/mandates\/([a-z0-9-]+)$/, (m) => pageMandate(m[1])],
+  [/^\/providers$/, () => pageProviders()],
   [/^\/usage$/, (m, q) => pageUsage(q)],
   [/^\/policy$/, () => pagePolicy()],
   [/^\/activity$/, () => pageActivity()],
@@ -664,6 +666,8 @@ const FIELD_TEXT = {
   rpm_limit: "Rate limit", allowed_models: "Models", default_max_tokens: "Default max tokens", fallback_enabled: "Fallback",
   usd_inr_rate: "USD→INR rate",
 };
+Object.assign(CHANGE_TEXT, { provider_key_added: "Provider key added", provider_key_removed: "Provider key removed",
+  model_added: "Model added", model_removed: "Model removed" });
 function fieldValue(key, v) {
   if (v == null) return key === "rpm_limit" ? "none" : "—";
   if (key === "budget_limit_micros") return String(Number(v) / 1e6);
@@ -676,6 +680,8 @@ function changeDetails(e) {
   if (d.changed) return Object.entries(d.changed).map(([k, c]) =>
     h("div", h("span.muted", `${FIELD_TEXT[k] || k}: `), `${fieldValue(k, c.before)} → ${fieldValue(k, c.after)}`));
   if (e.decision === "policy_updated") return h("div", `${d.from} → ${d.to}`, d.note ? h("span.muted", ` · ${d.note}`) : null);
+  if (d.provider_model) return h("div.muted", `${d.name} → ${d.provider_model} (key ${d.provider_key})`);
+  if (d.provider) return h("div.muted", `${d.name} · ${d.provider}`);
   if (d.name) return h("div.muted", `${d.name}${d.budget ? ` · budget ${d.budget} ${d.currency || ""}` : ""}`);
   return null;
 }
@@ -1142,25 +1148,35 @@ async function pageActivity() {
 async function pageSettings() {
   const [s, models, health] = await Promise.all([api("GET", "/admin/settings"), api("GET", "/admin/models"),
     fetch("/health/ready", { cache: "no-store" }).then((r) => r.json()).catch(() => ({}))]);
-  const rate = input({ type: "number", min: "1.0001", max: "1000", step: "0.01", value: s.usd_inr_rate, "aria-label": "Rupees per US dollar" });
-  const save = h("button.btn.primary", { type: "submit" }, "Save rate");
-  const err = formError();
+  // The rate changes rarely and moves every INR budget, so it is shown as a value with an explicit
+  // Edit step (same pattern as budgets) instead of an always-live input that invites accidental edits.
+  const rateBody = h("div.form");
+  const rateView = () => rateBody.replaceChildren(
+    h("div.rate-line", h("span.big-number", h("strong", `₹${Number(s.usd_inr_rate).toFixed(2)}`)), h("span.muted", "per 1 US dollar"),
+      h("button.btn.sm", { type: "button", onclick: rateEdit }, "Edit")),
+    h("div.help", s.usd_inr_rate_updated_at ? `Last changed ${when(s.usd_inr_rate_updated_at)}. Used for every INR budget.` : "Used for every INR budget."));
+  function rateEdit() {
+    const rate = input({ type: "number", min: "1.0001", max: "1000", step: "0.01", value: s.usd_inr_rate, "aria-label": "Rupees per US dollar" });
+    const save = h("button.btn.primary", { type: "submit" }, "Save rate");
+    const err = formError();
+    rateBody.replaceChildren(h("form.form", { onsubmit: async (e) => {
+      e.preventDefault();
+      err.clear();
+      await busy(save, async () => {
+        try { await api("PUT", "/admin/settings", { usd_inr_rate: rate.value }); toast("Rate saved. INR budgets use it from the next request."); refresh(); }
+        catch (ex) { err.show(ex.message); }
+      });
+    } }, err, h("div.input-group", h("span.addon", "₹"), rate), h("div.help", "Rupees for 1 US dollar. Applies to the next request."),
+    h("div.form-actions", h("button.btn", { type: "button", onclick: rateView }, "Cancel"), save)));
+    rate.focus();
+  }
+  rateView();
   const dot = (ok) => h("span", { class: `pill ${ok ? "ok" : "danger"}` }, ok ? "OK" : "Down");
   return [
     pageHead({ title: "Settings" }),
     h("div.grid-2",
       h("div.stack",
-        card({ title: "Exchange rate", hint: "Converts INR budgets to the USD that providers bill",
-          body: h("form.form", { onsubmit: async (e) => {
-            e.preventDefault();
-            err.clear();
-            await busy(save, async () => {
-              try { await api("PUT", "/admin/settings", { usd_inr_rate: rate.value }); toast("Rate saved. INR budgets use it from the next request."); refresh(); }
-              catch (ex) { err.show(ex.message); }
-            });
-          } }, err, h("div.field", h("label", { for: rate.id = "rate" }, "1 US dollar ="), h("div.input-group", h("span.addon", "₹"), rate),
-            h("div.help", s.usd_inr_rate_updated_at ? `Last changed ${when(s.usd_inr_rate_updated_at)}.` : "")),
-          h("div.form-actions", save)) }),
+        card({ title: "Exchange rate", hint: "Converts INR budgets to the USD that providers bill", body: rateBody }),
         card({ title: "Models and prices", hint: "Prices come from LiteLLM's price list, per 1 million tokens", flush: true,
           body: table([
             { label: "Model", render: (m) => h("div", h("div.mono", m.model), m.provider && h("div.cell-sub", m.provider)) },
@@ -1169,7 +1185,7 @@ async function pageSettings() {
             { label: "Max answer", align: "r", render: (m) => h("span.num", `${int(m.max_output_tokens)} tokens`) },
             { label: "Used by", render: (m) => chips(m.mandates) },
           ], models, { empty: emptyState("No models", "Add models in config/litellm.yaml.") }),
-          foot: h("div.toolbar", h("span.help", "To add a model or provider, edit config/litellm.yaml and put its key in .env, then restart LiteLLM. Keys are never stored in the database or shown here.")) })),
+          foot: h("div.toolbar", h("a", { href: "#/providers" }, "Add or remove keys and models on the Providers page")) })),
       h("div.stack",
         card({ title: "System", body: h("div.facts",
           h("div.fact", h("div.k", "Database"), h("div.v", dot(health.db))),
@@ -1182,6 +1198,137 @@ async function pageSettings() {
         card({ title: "This session", body: [h("div.help", "You're signed in with the admin token in this browser tab only."),
           h("div", h("button.btn", { type: "button", onclick: () => signOut() }, icon("logout"), "Sign out"))] }))),
   ];
+}
+
+// ------------------------------------------------------------------ providers (keys + models)
+// Design: keys are write-only. They are typed once, sent to LiteLLM (which encrypts them), and only a masked
+// hint ever comes back, so there is no "show key" button anywhere. Removing is blocked while something
+// depends on it (a key used by models, a model used by mandates) so nothing breaks silently.
+const MODEL_HINTS = { gemini: "gemini-2.5-flash", openai: "gpt-5-mini", anthropic: "claude-sonnet-4-5", mistral: "mistral-large-latest",
+  deepseek: "deepseek-chat", openrouter: "meta-llama/llama-3.3-70b-instruct", openai_compatible: "my-model" };
+
+async function pageProviders() {
+  const p = await api("GET", "/admin/providers");
+  const removeKey = async (k) => {
+    if (!(await confirmDialog({ title: `Remove key ${k.name}?`, danger: true, confirm: "Remove key",
+      message: "LiteLLM deletes it. Models that used it must be removed first." }))) return;
+    try { await api("DELETE", `/admin/providers/${k.name}`); toast("Key removed."); refresh(); } catch (ex) { toast(ex.message, "error"); }
+  };
+  const removeModel = async (m) => {
+    if (!(await confirmDialog({ title: `Remove model ${m.name}?`, danger: true, confirm: "Remove model",
+      message: "Agents can no longer use it. It must not be on any mandate." }))) return;
+    try { await api("DELETE", `/admin/models/${encodeURIComponent(m.name)}`); toast("Model removed."); refresh(); } catch (ex) { toast(ex.message, "error"); }
+  };
+  const envNote = p.env_providers.length
+    ? callout("", h("strong", "Also in use: "), `${p.env_providers.join(", ")} key(s) from the .env file, for the models marked "config file". Those are changed in the files, not here.`)
+    : null;
+  return [
+    pageHead({ title: "Providers", sub: "Your AI company keys and the models agents may use.",
+      actions: [h("button.btn", { type: "button", onclick: () => openAddModel(p) }, icon("plus"), "Add model"),
+        h("button.btn.primary", { type: "button", onclick: () => openAddKey(p) }, icon("plus"), "Add key")] }),
+    callout("", h("strong", "How keys are kept safe. "), "A key is sent once to LiteLLM, which encrypts it (AES-256-GCM) with a secret that exists only in the .env file. " +
+      "It is never stored in the gateway's database, never logged, and can't be shown again, not even here. Only a few characters are shown (like sk****ar) so you can tell keys apart."),
+    card({ title: "Keys", hint: `${p.keys.length} added here`, flush: true, body: [
+      table([
+        { label: "Name", render: (k) => h("span.cell-title", k.name) },
+        { label: "Provider", render: (k) => h("div", k.label, k.api_base && h("div.cell-sub", k.api_base)) },
+        { label: "Key", render: (k) => h("span.code", k.key_hint || "••••") },
+        { label: "Models", render: (k) => chips(k.models) },
+        { label: "Added", render: (k) => h("span.muted", k.added_at ? when(k.added_at) : "—") },
+        { label: "", align: "r", render: (k) => h("button.btn.sm.danger", { type: "button", onclick: () => removeKey(k) }, "Remove") },
+      ], p.keys, { empty: emptyState("No keys added here yet", "Add a key, then add the models it unlocks.",
+        h("button.btn.primary", { type: "button", onclick: () => openAddKey(p) }, icon("plus"), "Add key")) }),
+      envNote && h("div.card-body", envNote),
+    ] }),
+    card({ title: "Models", hint: "Agents can only use a model once it's on one of their mandates", flush: true, body: table([
+      { label: "Model name", render: (m) => h("div", h("div.mono", m.name), h("div.cell-sub", m.provider_model)) },
+      { label: "Key", render: (m) => (m.source === "config" ? h("span.pill.plain", "config file") : h("span.chip", m.provider_key)) },
+      { label: "Price per 1M tokens", render: (m) => (m.priced ? h("span.num", `${money(m.input_usd_per_1m)} in · ${money(m.output_usd_per_1m)} out`) : h("span.pill.warn.plain", "No price")) },
+      { label: "Used by", render: (m) => chips(m.mandates) },
+      { label: "", align: "r", render: (m) => (m.source === "console"
+        ? h("button.btn.sm.danger", { type: "button", onclick: () => removeModel(m) }, "Remove")
+        : h("span.faint", { title: "Defined in config/litellm.yaml" }, "In files")) },
+    ], p.models, { empty: emptyState("No models yet") }) }),
+  ];
+}
+
+function openAddKey(p) {
+  const m = modal({ title: "Add a provider key", sub: "Paste the key from the AI company's website. You won't be able to see it again after saving." });
+  const provider = select(p.provider_choices.map((c) => [c.id, c.label]), "gemini");
+  const name = input({ class: "mono", value: "gemini-main", maxlength: "64" });
+  let nameEdited = false;
+  name.addEventListener("input", () => { nameEdited = true; });
+  const key = input({ type: "password", autocomplete: "off", class: "mono", placeholder: "Paste the API key" });
+  const base = input({ class: "mono", placeholder: "https://my-server.example.com/v1" });
+  const baseField = field("Base URL", base, "Only for OpenAI-compatible servers (self-hosted or other companies).");
+  const sync = () => {
+    baseField.classList.toggle("hidden", provider.value !== "openai_compatible");
+    if (!nameEdited) name.value = `${provider.value.replace("_", "-")}-main`;
+  };
+  provider.addEventListener("change", sync);
+  sync();
+  const err = formError();
+  const submit = h("button.btn.primary", { type: "submit", form: "add-key" }, "Save key");
+  append(m.body, h("form.form", { id: "add-key", onsubmit: async (e) => {
+    e.preventDefault();
+    err.clear();
+    if (key.value.trim().length < 8) return err.show("Paste the full API key.");
+    await busy(submit, async () => {
+      try {
+        await api("POST", "/admin/providers", { name: name.value, provider: provider.value, api_key: key.value.trim(),
+          ...(provider.value === "openai_compatible" ? { api_base: base.value.trim() } : {}) });
+        key.value = "";
+        m.close();
+        toast("Key saved and encrypted. Now add the models it unlocks.");
+        refresh();
+      } catch (ex) { err.show(ex.message); }
+    });
+  } }, err, h("div.row", field("Provider", provider), field("Name", name, "Lowercase, numbers and dashes. Used to pick this key for models.")),
+  field("API key", key), baseField));
+  append(m.foot, h("button.btn", { type: "button", onclick: m.close }, "Cancel"), submit);
+}
+
+function openAddModel(p) {
+  const m = modal({ title: "Add a model", sub: "Pick which key pays for it and the model's ID at that company." });
+  if (!p.keys.length) {
+    append(m.body, callout("warn", "Add a provider key first."));
+    append(m.foot, h("button.btn.primary", { type: "button", onclick: () => { m.close(); openAddKey(p); } }, "Add key"));
+    return;
+  }
+  const keyOf = Object.fromEntries(p.keys.map((k) => [k.name, k]));
+  const key = select(p.keys.map((k) => [k.name, `${k.name} (${k.label})`]), p.keys[0].name);
+  const pm = input({ class: "mono" });
+  const name = input({ class: "mono", maxlength: "128" });
+  let nameEdited = false;
+  name.addEventListener("input", () => { nameEdited = true; });
+  pm.addEventListener("input", () => { if (!nameEdited) name.value = pm.value.split("/").pop(); });
+  const hint = () => { pm.placeholder = `e.g. ${MODEL_HINTS[keyOf[key.value].provider] || "model-id"}`; };
+  key.addEventListener("change", hint);
+  hint();
+  const pin = input({ type: "number", min: "0", step: "0.01", placeholder: "Automatic" });
+  const pout = input({ type: "number", min: "0", step: "0.01", placeholder: "Automatic" });
+  const err = formError();
+  const submit = h("button.btn.primary", { type: "submit", form: "add-model" }, "Add model");
+  append(m.body, h("form.form", { id: "add-model", onsubmit: async (e) => {
+    e.preventDefault();
+    err.clear();
+    if (!pm.value.trim() || !name.value.trim()) return err.show("Enter the model ID and a name.");
+    if (!!pin.value !== !!pout.value) return err.show("Enter both prices, or leave both empty.");
+    await busy(submit, async () => {
+      try {
+        await api("POST", "/admin/models", { name: name.value.trim(), provider_key: key.value, provider_model: pm.value.trim(),
+          ...(pin.value ? { input_usd_per_1m: pin.value, output_usd_per_1m: pout.value } : {}) });
+        m.close();
+        toast("Model added. Put it on a mandate so agents can use it.");
+        refresh();
+      } catch (ex) { err.show(ex.code === "PRICE_UNKNOWN" ? `${ex.message}.` : ex.message); }
+    });
+  } }, err, field("Key", key), h("div.row", field("Model ID at the provider", pm, "Exactly as the provider names it."),
+    field("Name in the gateway", name, "What agents and mandates use.")),
+  h("div.field", h("span.label", "Price per 1 million tokens (USD, optional)"),
+    h("div.row", h("div.input-group", h("span.addon", "In $"), pin), h("div.input-group", h("span.addon", "Out $"), pout)),
+    h("div.help", "Leave empty to use LiteLLM's price list. Needed only for models LiteLLM doesn't know; without a price the gateway can't budget the model."))));
+  append(m.foot, h("button.btn", { type: "button", onclick: m.close }, "Cancel"), submit);
 }
 
 // ------------------------------------------------------------------ boot

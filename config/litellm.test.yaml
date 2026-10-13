@@ -18,7 +18,8 @@ model_list:
 general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/DATABASE_URL
-  store_model_in_db: false
+  store_model_in_db: true               # models + provider keys added from the admin console live in LiteLLM's DB
+  encryption_algorithm: aes-256-gcm     # stored provider keys are encrypted with LITELLM_SALT_KEY (only in .env)
   disable_spend_logs: true              # the gateway keeps the per-request records; key spend still updates
   fail_closed_budget_enforcement: true  # LiteLLM refuses a call whose estimate exceeds the key's remaining backstop
 

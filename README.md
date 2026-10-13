@@ -46,15 +46,22 @@ Open the console at **http://127.0.0.1:8080/admin/ui** and sign in with `ADMIN_T
 **Stop or restart:** `docker compose stop` / `docker compose up -d`. All state lives in the volume `ai-agent-gateway_pgdata`.
 `docker compose down -v` **deletes everything**. Database changes are applied automatically by the `migrate` service.
 
-### Where keys live (and why the database is safe to lose)
+### Where keys live (and why a stolen database leaks nothing)
 
-Provider keys are **only in `.env`** on the gateway machine. They are never written to either database, never sent to
-agents and never shown in the console. Someone who steals the database gets no provider keys and no usable agent tokens.
+Provider keys are added on the console's **Providers** page (or, for the original Gemini key, in `.env`).
+- Console keys go once to LiteLLM, which stores them **encrypted (AES-256-GCM) with `LITELLM_SALT_KEY`**, a secret
+  that exists only in `.env` and only in the LiteLLM container. A copy of either database contains no usable key.
+- LiteLLM's API only ever returns a masked hint (e.g. `sk****ar`); there is no way to read a key back, in the console or the API.
+- Keys never touch the gateway's own database or logs; the Activity log records only the key's name and provider.
+- The end-to-end test adds a sentinel key and checks it appears in neither database nor any container log.
+- Trade-off: the gateway holds `LITELLM_MASTER_KEY` so the console can manage LiteLLM. Someone who takes over the
+  gateway container could add/remove models and use stored keys through LiteLLM, but still can't read them.
 
 | Secret (`.env`) | Read by | Purpose |
 |---|---|---|
-| `GEMINI_API_KEY` (and any other provider key) | LiteLLM only | Calling the provider |
-| `LITELLM_MASTER_KEY`, `LITELLM_SALT_KEY` | LiteLLM only | LiteLLM admin / credential encryption |
+| `GEMINI_API_KEY` (keys added in the console live encrypted in LiteLLM's DB instead) | LiteLLM only | Calling the provider |
+| `LITELLM_SALT_KEY` | LiteLLM only | Encrypts stored provider keys |
+| `LITELLM_MASTER_KEY` | LiteLLM + gateway | LiteLLM admin; the gateway uses it only for the Providers page |
 | `LITELLM_GATEWAY_KEY` | gateway | Scoped LiteLLM key: configured models only, $10 backstop |
 | `ADMIN_TOKEN` | you | Admin console and API |
 | `POSTGRES_PASSWORD` | bootstrap only | Superuser, which no service uses |
@@ -72,6 +79,7 @@ agents and never shown in the console. Someone who steals the database gets no p
 |---|---|
 | **Overview** | This month's spend, charged calls, blocked calls, a 30-day spend chart, and a "Needs attention" list (budgets ≥ 80%, suspended agents, calls charged without an answer, agents without a token or mandate) |
 | **Agents** | Create agents (token shown once), switch Active / Suspended / Revoked, monthly budget in USD or INR, rate limit, rotate token, assign mandates, copy each mandate's base URL, recent calls and changes |
+| **Providers** | Add AI company keys (write-only, encrypted), add models with automatic or manual prices, remove them when nothing uses them |
 | **Mandates** | Create mandates, ordered model list (order = fallback order), fallback on/off, default answer limit, monthly budget, assign agents, suspend |
 | **Usage** | Every call with result, model (and fallback), tokens, cost and time taken, filterable; monthly totals by agent, mandate or model |
 | **Policy** | Built-in rules (read-only) and your own rules, saved as numbered versions with history |
@@ -247,6 +255,11 @@ The mandate's own fallback order can now be set on Mandates → ResearchOS devel
 
 ## 12. Adding a provider or model
 
+**From the console (normal way):** Providers → **Add key** (pick the company, paste the key) → **Add model** (pick the
+key, type the company's model ID; prices come from LiteLLM's list or you type them) → put the model on a mandate.
+No restart. A model with no known price is refused, because the gateway can't budget it.
+
+**From files (for models that should be reviewed in git):**
 1. Add the key to `.env` and pass it to the `litellm` service in `docker-compose.yml`.
 2. Add the model to `config/litellm.yaml` with `api_key: os.environ/NAME`. A model missing from LiteLLM's price
    table needs `input_cost_per_token` / `output_cost_per_token` there, or the gateway refuses it.

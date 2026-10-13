@@ -13,7 +13,8 @@ Proves, for two agents A and B sharing one mandate:
   6. LiteLLM's own accounting agrees: the gateway key's spend rose by exactly what the gateway charged
   7. restoring A lets A work again
   8. a busy model (429) falls back to the next model in the mandate's list, through the real LiteLLM
-  9. deployment checks: LiteLLM/Postgres not published, no secrets tracked in git, gateway holds no provider secrets
+  9. provider key + model added from the console API work end to end; the raw key is in no database
+ 10. deployment checks: LiteLLM/Postgres not published, no secrets tracked in git, gateway holds no provider secrets
 """
 import json, os, pathlib, subprocess, sys, time, urllib.error, urllib.request
 
@@ -195,7 +196,40 @@ def main() -> int:
     last = usage(agent=B)[0]
     check("one usage row, 2 attempts, fallback model recorded", last["attempts"] == 2 and last["model_served"] == "mock-model-2")
 
-    print("== 9. deployment checks")
+    print("== 9. provider key and model managed from the console API")
+    sentinel = f"sk-e2e-sentinel-{RUN}-do-not-store-in-clear"
+    keyname, model = f"e2e-key-{RUN}", f"console-mock-{RUN}"
+    status, _ = http("POST", GW + "/admin/providers", {"name": keyname, "provider": "openai_compatible", "api_key": sentinel,
+                                                       "api_base": "http://mock-upstream:9000/v1"}, ADMIN_TOKEN)
+    check("key saved", status == 201, f"HTTP {status}")
+    listed = admin("GET", "/admin/providers")
+    hint = next((k["key_hint"] for k in listed["keys"] if k["name"] == keyname), None)
+    check("key is never returned in full", hint is not None and sentinel not in json.dumps(listed), f"hint={hint}")
+    status, body = http("POST", GW + "/admin/models", {"name": model + "-x", "provider_key": keyname,
+                                                       "provider_model": "no-such-model-anywhere"}, ADMIN_TOKEN)
+    check("model with no known price is refused and not left behind",
+          status == 400 and body["error"]["code"] == "PRICE_UNKNOWN" and model + "-x" not in json.dumps(admin("GET", "/admin/providers")), f"HTTP {status}")
+    status, _ = http("POST", GW + "/admin/models", {"name": model, "provider_key": keyname, "provider_model": "console-mock",
+                                                    "input_usd_per_1m": "1", "output_usd_per_1m": "2"}, ADMIN_TOKEN)
+    check("model added with manual prices", status == 201, f"HTTP {status}")
+    admin("PATCH", f"/admin/mandates/{M}", {"allowed_models": ["mock-model", "mock-model-2", model]})
+    before = count()
+    status, data = http("POST", f"{GW}/m/{M}/v1/chat/completions", {"model": model, "messages": [{"role": "user", "content": "e2e"}]}, tokens[B])
+    check("agent call through the console-added model", status == 200 and count() == before + 1, f"HTTP {status}")
+    status, _ = http("DELETE", f"{GW}/admin/models/{model}", None, ADMIN_TOKEN)
+    check("model on a mandate can't be removed", status == 409, f"HTTP {status}")
+    admin("PATCH", f"/admin/mandates/{M}", {"allowed_models": ["mock-model", "mock-model-2"]})
+    status, _ = http("DELETE", f"{GW}/admin/providers/{keyname}", None, ADMIN_TOKEN)
+    check("key used by a model can't be removed", status == 409, f"HTTP {status}")
+    dumps = sh("docker", "compose", "exec", "-T", "db", "pg_dump", "-U", dotenv("POSTGRES_USER"), "-d", "litellm") + \
+        sh("docker", "compose", "exec", "-T", "db", "pg_dump", "-U", dotenv("POSTGRES_USER"), "-d", "gateway")
+    check("raw key is in neither database (stored encrypted)", sentinel not in dumps and len(dumps) > 10_000)
+    logs = sh("docker", "compose", "logs", "gateway", "litellm", check=False)
+    check("raw key is in no container log", sentinel not in logs)
+    ok = all(http("DELETE", f"{GW}{path}", None, ADMIN_TOKEN)[0] == 200 for path in (f"/admin/models/{model}", f"/admin/providers/{keyname}"))
+    check("model and key removed", ok and keyname not in json.dumps(admin("GET", "/admin/providers")))
+
+    print("== 10. deployment checks")
     cfg = json.loads(subprocess.run(["docker", "compose", "-f", "docker-compose.yml", "config", "--format", "json"],
                                     cwd=ROOT, capture_output=True, text=True, check=True).stdout)
     published = {s: v.get("ports") for s, v in cfg["services"].items() if v.get("ports")}
@@ -209,8 +243,8 @@ def main() -> int:
               and any(s in (ROOT / f).read_text(errors="ignore") for s in secrets)]
     check("no .env secret value appears in any tracked file", not leaked, ", ".join(leaked))
     env_names = sh("docker", "compose", "exec", "-T", "gateway", "env").split("\n")
-    check("gateway container has no master/salt/provider/owner secrets",
-          not [n for n in env_names if n.split("=")[0] in ("LITELLM_MASTER_KEY", "LITELLM_SALT_KEY", "GEMINI_API_KEY",
+    check("gateway container has no salt/provider/owner secrets",
+          not [n for n in env_names if n.split("=")[0] in ("LITELLM_SALT_KEY", "GEMINI_API_KEY",
                                                            "GATEWAY_OWNER_PASSWORD", "POSTGRES_PASSWORD")])
 
     sh("docker", "compose", "stop")

@@ -1,0 +1,1189 @@
+/* Agent Gateway admin console. Plain JS, no build step, no external requests.
+   Security: every value from the API is inserted as text (never innerHTML); the admin token lives
+   in sessionStorage for this tab only. */
+"use strict";
+
+// ------------------------------------------------------------------ DOM helpers
+const SVGNS = "http://www.w3.org/2000/svg";
+let uid = 0;
+
+function h(tag, attrs, ...kids) {
+  const [name, ...classes] = tag.split(".");
+  const el = document.createElement(name || "div");
+  if (classes.length) el.className = classes.join(" ");
+  if (attrs == null || typeof attrs !== "object" || attrs instanceof Node || Array.isArray(attrs)) {
+    kids.unshift(attrs);
+    attrs = {};
+  }
+  for (const [k, v] of Object.entries(attrs)) {
+    if (v == null || v === false || k === "value" || k === "checked") continue;
+    if (k === "class") el.className = [el.className, v].filter(Boolean).join(" ");
+    else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v === true ? "" : v);
+  }
+  append(el, kids);
+  if ("value" in attrs && attrs.value != null) el.value = attrs.value;
+  if ("checked" in attrs) el.checked = !!attrs.checked;
+  return el;
+}
+
+function append(el, ...kids) {
+  for (const c of kids.flat(Infinity)) {
+    if (c == null || c === false || c === true) continue;
+    el.append(c instanceof Node ? c : String(c));
+  }
+  return el;
+}
+
+function svg(tag, attrs = {}, ...kids) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs)) if (v != null) el.setAttribute(k, v);
+  for (const c of kids.flat()) if (c != null) el.append(c instanceof Node ? c : String(c));
+  return el;
+}
+
+const ICONS = {
+  overview: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
+  agents: "M12 3v3M7 7h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3v-7a3 3 0 0 1 3-3zM9.5 13.5h.01M14.5 13.5h.01",
+  mandates: "M4 8h16v11H4zM9 8V5h6v3M4 13h16",
+  usage: "M4 19h16M7 16V10M12 16V5M17 16v-4",
+  policy: "M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z",
+  activity: "M12 7v5l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
+  settings: "M4 7h10M18 7h2M4 17h4M12 17h8M14 5v4M8 15v4",
+  plus: "M12 5v14M5 12h14",
+  up: "M12 19V5M6 11l6-6 6 6",
+  down: "M12 5v14M6 13l6 6 6-6",
+  x: "M6 6l12 12M18 6L6 18",
+  copy: "M9 9h10v10H9zM5 15V5h10",
+  key: "M14.5 9.5a3.5 3.5 0 1 1-1 2.5L4 21.5V18h3v-3h3l1-1M17 7h.01",
+  info: "M12 8h.01M11 12h1v5h1M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
+  alert: "M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z",
+  arrow: "M5 12h14M13 6l6 6-6 6",
+  logout: "M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10",
+  gate: "M4 21V9l8-5 8 5v12M9 21v-6h6v6",
+  lock: "M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z",
+  empty: "M4 13h4l2 3h4l2-3h4M4 13l3-8h10l3 8v6H4z",
+  check: "M5 12l5 5 9-10",
+};
+
+function icon(name) {
+  return svg("svg", { viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8",
+    "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true" }, svg("path", { d: ICONS[name] }));
+}
+
+// ------------------------------------------------------------------ formatting
+const CURRENCY = { USD: { sym: "$", locale: "en-US" }, INR: { sym: "₹", locale: "en-IN" } };
+
+function money(value, currency = "USD") {
+  const n = Number(value || 0);
+  const abs = Math.abs(n);
+  const digits = abs === 0 || abs >= 1 ? 2 : abs >= 0.01 ? 4 : 6;
+  const c = CURRENCY[currency] || CURRENCY.USD;
+  return c.sym + n.toLocaleString(c.locale, { minimumFractionDigits: 2, maximumFractionDigits: digits });
+}
+const int = (n) => Number(n || 0).toLocaleString("en-US");
+const dateTime = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
+const dateOnly = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", year: "numeric" });
+const when = (iso) => (iso ? dateTime.format(new Date(iso)) : "—");
+function ago(iso) {
+  if (!iso) return "Never";
+  const s = (Date.now() - new Date(iso).getTime()) / 1000;
+  if (s < 60) return "Just now";
+  if (s < 3600) return `${Math.floor(s / 60)} min ago`;
+  if (s < 86400) return `${Math.floor(s / 3600)} h ago`;
+  return `${Math.floor(s / 86400)} d ago`;
+}
+function monthName(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  return new Date(y, m - 1, 1).toLocaleString(undefined, { month: "long", year: "numeric" });
+}
+function nextReset(ym) {
+  const [y, m] = ym.split("-").map(Number);
+  return new Date(y, m, 1).toLocaleString(undefined, { day: "numeric", month: "long" });
+}
+function currentMonth() {
+  // budget months follow India time
+  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit" }).formatToParts(new Date());
+  return `${parts.find((p) => p.type === "year").value}-${parts.find((p) => p.type === "month").value}`;
+}
+const slugify = (s) => s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+
+const REASONS = {
+  AGENT_REVOKED: "Agent revoked", AGENT_INACTIVE: "Agent suspended", MANDATE_NOT_ASSIGNED: "Not assigned to mandate",
+  MANDATE_INACTIVE: "Mandate suspended", MODEL_NOT_ALLOWED: "Model not allowed", AGENT_BUDGET_EXCEEDED: "Agent budget used up",
+  MANDATE_BUDGET_EXCEEDED: "Mandate budget used up", AGENT_RATE_LIMITED: "Rate limit reached",
+  UPSTREAM_RATE_LIMITED: "Provider busy", UPSTREAM_UNAVAILABLE: "Model service unavailable", UPSTREAM_TIMEOUT: "Model timed out",
+  UPSTREAM_ERROR: "Provider error", FIELD_NOT_ALLOWED: "Field not allowed", INVALID_REQUEST: "Invalid request",
+  INVALID_JSON: "Invalid JSON", CONTENT_NOT_ALLOWED: "Content not allowed", TOOL_NOT_ALLOWED: "Tool not allowed",
+  STREAMING_NOT_SUPPORTED: "Streaming not supported", REQUEST_TOO_LARGE: "Request too large", ABANDONED: "Abandoned, charged",
+};
+const reasonText = (code) => REASONS[code] || code;
+
+// ------------------------------------------------------------------ API
+const TOKEN_KEY = "gw_admin_token";
+const store = { token: readToken() };
+
+function readToken() {
+  try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch { return ""; }
+}
+function saveToken(t) {
+  store.token = t;
+  try { t ? sessionStorage.setItem(TOKEN_KEY, t) : sessionStorage.removeItem(TOKEN_KEY); } catch { /* private mode */ }
+}
+
+class ApiError extends Error {
+  constructor(status, code, message) { super(message); this.status = status; this.code = code; }
+}
+
+async function api(method, path, body) {
+  const headers = { Authorization: `Bearer ${store.token}` };
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  let res;
+  try {
+    res = await fetch(path, { method, headers, body: body === undefined ? undefined : JSON.stringify(body), cache: "no-store" });
+  } catch {
+    throw new ApiError(0, "NETWORK", "Can't reach the gateway. Is it running?");
+  }
+  let data = null;
+  try { data = await res.json(); } catch { /* empty body */ }
+  if (res.status === 401 && path.startsWith("/admin/")) {
+    signOut("Your admin token was not accepted. Sign in again.");
+    throw new ApiError(401, "ADMIN_UNAUTHORIZED", "Signed out");
+  }
+  if (!res.ok) throw new ApiError(res.status, data?.error?.code, data?.error?.message || `Request failed (${res.status})`);
+  return data;
+}
+
+// ------------------------------------------------------------------ feedback: toasts, modals, confirm
+function toast(message, kind = "") {
+  let host = document.querySelector(".toasts");
+  if (!host) document.body.append(host = h("div.toasts", { role: "status", "aria-live": "polite" }));
+  const t = h("div", { class: `toast ${kind}` }, message);
+  host.append(t);
+  setTimeout(() => t.remove(), kind === "error" ? 6000 : 3200);
+}
+
+function modal({ title, sub, wide }) {
+  const previous = document.activeElement;
+  const body = h("div.modal-body");
+  const foot = h("div.modal-foot");
+  const box = h("div", { class: `modal${wide ? " wide" : ""}`, role: "dialog", "aria-modal": "true", "aria-label": title },
+    h("div.modal-head", h("h2", title), sub && h("p", sub)), body, foot);
+  const overlay = h("div.overlay", box);
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  function close() {
+    overlay.remove();
+    document.removeEventListener("keydown", onKey);
+    previous?.focus?.();
+  }
+  overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
+  document.addEventListener("keydown", onKey);
+  document.body.append(overlay);
+  requestAnimationFrame(() => (box.querySelector("input:not([type=checkbox]), select, textarea") || box.querySelector(".btn.primary") || box).focus());
+  box.tabIndex = -1;
+  return { body, foot, close };
+}
+
+function confirmDialog({ title, message, confirm = "Confirm", danger = false }) {
+  return new Promise((resolve) => {
+    const m = modal({ title });
+    let answered = false;
+    const done = (v) => { if (!answered) { answered = true; m.close(); resolve(v); } };
+    append(m.body, h("p.m0", message));
+    append(m.foot,
+      h("button.btn", { type: "button", onclick: () => done(false) }, "Cancel"),
+      h("button", { type: "button", class: `btn ${danger ? "danger solid" : "primary"}`, onclick: () => done(true) }, confirm));
+    const obs = new MutationObserver(() => { if (!document.body.contains(m.body)) { obs.disconnect(); done(false); } });
+    obs.observe(document.body, { childList: true });
+  });
+}
+
+function formError() {
+  const el = h("div.form-error.hidden", { role: "alert" });
+  el.show = (msg) => { el.textContent = msg; el.classList.remove("hidden"); };
+  el.clear = () => el.classList.add("hidden");
+  return el;
+}
+
+async function busy(button, fn) {
+  const label = button.textContent;
+  button.disabled = true;
+  try { return await fn(); } finally { button.disabled = false; button.textContent = label; }
+}
+
+async function copyText(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    toast("Copied to clipboard");
+  } catch {
+    toast("Couldn't copy automatically. Select the text and copy it.", "error");
+  }
+}
+
+// ------------------------------------------------------------------ form controls
+function field(label, control, help) {
+  if (!control.id) control.id = `f${++uid}`;
+  return h("div.field", h("label", { for: control.id }, label), control, help && h("div.help", help));
+}
+const input = (attrs = {}) => h("input.input", { type: "text", autocomplete: "off", spellcheck: "false", ...attrs });
+function select(options, value, attrs = {}) {
+  return h("select.select", { ...attrs, value }, options.map(([v, label]) => h("option", { value: v }, label)));
+}
+function toggle(label, checked, onchange) {
+  const box = h("input", { type: "checkbox", role: "switch", checked, onchange: onchange && ((e) => onchange(e.target.checked)) });
+  const el = h("label.switch", box, h("span", label));
+  el.input = box;
+  return el;
+}
+
+/** Segmented control. options: [[value, label, toneClass?]]. el.value is the current value. */
+function segmented(options, value, onchange, label) {
+  const el = h("div.seg", { role: "group", "aria-label": label || "" });
+  el.value = value;
+  const buttons = options.map(([v, text, tone]) => h("button", {
+    type: "button", class: tone || "", "aria-pressed": String(v === value),
+    onclick: () => {
+      if (el.value === v) return;
+      el.value = v;
+      buttons.forEach((b, i) => b.setAttribute("aria-pressed", String(options[i][0] === v)));
+      onchange?.(v);
+    },
+  }, text));
+  append(el, buttons);
+  return el;
+}
+
+/** Amount + currency picker. Returns { el, get(), amount } */
+function budgetInput(amount, currency) {
+  const addon = h("span.addon", CURRENCY[currency].sym);
+  const amountInput = input({ type: "number", min: "0", step: "0.01", inputmode: "decimal", value: amount, "aria-label": "Monthly budget amount" });
+  const seg = segmented([["USD", "USD"], ["INR", "INR"]], currency, (c) => { addon.textContent = CURRENCY[c].sym; }, "Budget currency");
+  const el = h("div.input-group", addon, amountInput, seg);
+  return { el, amount: amountInput, get: () => ({ budget: amountInput.value.trim() || "0", budget_currency: seg.value }) };
+}
+
+// ------------------------------------------------------------------ display components
+const STATUS_TONE = { active: "ok", suspended: "warn", revoked: "danger" };
+const titleCase = (s) => s.charAt(0).toUpperCase() + s.slice(1);
+const statusPill = (status) => h("span", { class: `pill ${STATUS_TONE[status] || ""}` }, titleCase(status));
+const OUTCOME = { ok: ["Answered", "ok"], denied: ["Blocked", "danger"], error: ["Failed", "warn"], timeout: ["Timed out", "warn"] };
+const outcomePill = (o) => h("span", { class: `pill ${OUTCOME[o]?.[1] || ""}` }, OUTCOME[o]?.[0] || o);
+
+function meter(v, large = false) {
+  const budget = Number(v.budget), spent = Number(v.spent), held = Number(v.reserved);
+  const pct = budget > 0 ? (spent / budget) * 100 : spent > 0 ? 100 : 0;
+  const holdPct = budget > 0 ? (held / budget) * 100 : 0;
+  const level = v.used_pct >= 100 ? "danger" : v.used_pct >= 80 ? "warn" : "";
+  const fill = h("div.meter-fill");
+  fill.style.width = `${Math.min(100, pct)}%`;
+  const hold = h("div.meter-hold", { title: held > 0 ? `${money(held, v.budget_currency)} held for calls in progress` : null });
+  hold.style.width = `${Math.max(0, Math.min(100 - Math.min(100, pct), holdPct))}%`;
+  return h("div", { class: `meter ${level}${large ? " lg" : ""}` },
+    h("div.meter-track", { role: "img", "aria-label": `${Math.round(v.used_pct)}% of budget used` }, fill, hold),
+    h("div.meter-label",
+      h("span", h("strong", money(spent, v.budget_currency)), ` of ${money(budget, v.budget_currency)}`),
+      h("span", budget > 0 ? `${Math.round(v.used_pct)}%` : "No budget")));
+}
+
+function chips(items, { lead = false, arrows = false, text = false } = {}) {
+  if (!items.length) return h("span.faint", "None");
+  const out = [];
+  items.forEach((t, i) => {
+    if (i && arrows) out.push(h("span.chip-sep", { "aria-hidden": "true" }, "→"));
+    out.push(h("span", { class: `chip${lead && i === 0 ? " lead" : ""}${text ? " text" : ""}` }, t));
+  });
+  return h("div.chips", out);
+}
+
+function card({ title, hint, actions, body, flush = false, foot }) {
+  return h("section.card",
+    (title || actions) && h("div.card-head", h("div", title && h("h2", title), hint && h("div.hint", hint)), actions && h("div.actions", actions)),
+    body !== undefined && h("div", { class: `card-body${flush ? " flush" : ""}` }, body),
+    foot);
+}
+
+function emptyState(title, text, action) {
+  return h("div.empty", icon("empty"), h("strong", title), text && h("div", text), action);
+}
+
+function pageHead({ crumbs, title, badge, sub, actions }) {
+  return h("header.page-head",
+    h("div", crumbs && h("div.crumbs", crumbs), h("h1", title, badge), sub && h("div.sub", sub)),
+    actions && h("div.actions", actions));
+}
+
+/** cols: [{ label, render(row), align: "r", width }] */
+function table(cols, rows, { onRow, empty, foot } = {}) {
+  if (!rows.length) return empty || emptyState("Nothing here yet");
+  return h("div.table-wrap", h("table",
+    h("thead", h("tr", cols.map((c) => h("th", { class: c.align || null, scope: "col" }, c.label)))),
+    h("tbody", rows.map((r) => h("tr", {
+      class: onRow ? "clickable" : null,
+      onclick: onRow ? (e) => { if (!e.target.closest("a, button, input, select")) onRow(r); } : null,
+    }, cols.map((c) => h("td", { class: c.align || null }, c.render(r)))))),
+    foot && h("tfoot", h("tr", foot.map((f, i) => h("td", { class: cols[i]?.align || null }, f))))));
+}
+
+function niceMax(v) {
+  if (v <= 0) return 0;
+  const e = 10 ** Math.floor(Math.log10(v));
+  const f = v / e;
+  return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * e;
+}
+
+/** Bar chart of daily values. points: [{ day: "YYYY-MM-DD", value, title }] */
+function barChart(points, label) {
+  const W = 720, H = 190, L = 64, R = 8, T = 10, B = 26;
+  const top = niceMax(Math.max(0, ...points.map((p) => p.value)));
+  const plotH = H - T - B, step = (W - L - R) / Math.max(1, points.length);
+  const el = svg("svg", { viewBox: `0 0 ${W} ${H}`, class: "chart", role: "img", "aria-label": label });
+  for (let i = 0; i <= (top ? 2 : 0); i++) {
+    const y = T + plotH - (plotH * i) / 2;
+    el.append(svg("line", { x1: L, x2: W - R, y1: y, y2: y, class: "grid" }),
+      svg("text", { x: L - 8, y: y + 4, "text-anchor": "end", class: "axis" }, money((top * i) / 2)));
+  }
+  points.forEach((p, i) => {
+    const hgt = top ? (p.value / top) * plotH : 0;
+    const bar = svg("rect", { x: L + i * step + step * 0.16, width: step * 0.68, y: T + plotH - Math.max(hgt, 1.5),
+      height: Math.max(hgt, 1.5), rx: 2, class: p.value > 0 ? "bar" : "bar zero" }, svg("title", {}, p.title));
+    el.append(bar);
+    if ((i % 7 === 0 && points.length - 1 - i >= 4) || i === points.length - 1) {
+      const d = new Date(`${p.day}T00:00:00`);
+      el.append(svg("text", { x: L + i * step + step / 2, y: H - 8, "text-anchor": "middle", class: "axis" },
+        d.toLocaleDateString(undefined, { day: "numeric", month: "short" })));
+    }
+  });
+  return el;
+}
+
+function dailyChartCard(daily, title = "Daily spend", hint = "Last 30 days, India time") {
+  const total = daily.reduce((s, d) => s + Number(d.cost_usd), 0);
+  const calls = daily.reduce((s, d) => s + d.requests, 0);
+  const blocked = daily.reduce((s, d) => s + d.denied, 0);
+  const points = daily.map((d) => ({ day: d.day, value: Number(d.cost_usd),
+    title: `${dateOnly.format(new Date(`${d.day}T00:00:00`))}: ${money(d.cost_usd)} · ${d.requests} calls · ${d.denied} blocked` }));
+  return card({ title, hint, body: [
+    barChart(points, `${title}: ${money(total)} over ${daily.length} days`),
+    h("div.chart-legend", h("span", `${money(total)} spent · ${int(calls)} sent to a model · ${int(blocked)} blocked`), h("span", "Hover a bar for the day")),
+  ] });
+}
+
+function copyRow(text, label) {
+  return h("div.copy-row", h("span.code", { title: text }, text),
+    h("button.btn.sm", { type: "button", "aria-label": `Copy ${label || text}`, onclick: () => copyText(text) }, icon("copy"), "Copy"));
+}
+
+function callout(kind, ...content) {
+  return h("div", { class: `callout ${kind || ""}` }, icon(kind === "warn" || kind === "danger" ? "alert" : "info"), h("div", content));
+}
+
+function errorCard(e, retry) {
+  return card({ body: h("div.page-error", callout("danger", h("strong", "Couldn't load this page. "), e.message),
+    retry && h("div", h("button.btn", { type: "button", onclick: retry }, "Try again"))) });
+}
+
+// ------------------------------------------------------------------ shell, routing, sign-in
+const NAV = [
+  ["overview", "Overview"], ["agents", "Agents"], ["mandates", "Mandates"], ["usage", "Usage"],
+  ["policy", "Policy"], ["activity", "Activity"], ["settings", "Settings"],
+];
+const root = () => document.getElementById("app");
+let renderSeq = 0;
+
+function shell() {
+  const nav = h("nav.nav", { "aria-label": "Main" },
+    h("div.nav-label", "Manage"),
+    NAV.slice(0, 3).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)),
+    h("div.nav-label", "Monitor"),
+    NAV.slice(3, 5).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)),
+    h("div.nav-label", "System"),
+    NAV.slice(5).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)));
+  return h("div.shell",
+    h("aside.side",
+      h("div.brand", h("div.brand-mark", icon("gate")), h("div", h("div.brand-name", "Agent Gateway"), h("div.brand-sub", "Admin console"))),
+      nav,
+      h("div.side-foot", h("span", "Signed in with the admin token"),
+        h("button.btn.ghost.sm", { type: "button", onclick: () => signOut() }, icon("logout"), "Sign out"))),
+    h("main.main", { id: "main" }, h("div.page", { id: "page" })));
+}
+
+function signOut(message) {
+  saveToken("");
+  location.hash = "";
+  renderLogin(message);
+}
+
+function renderLogin(message) {
+  const token = input({ type: "password", autocomplete: "current-password", placeholder: "adm_…", class: "mono" });
+  const err = formError();
+  if (message) err.show(message);
+  const submit = h("button.btn.primary", { type: "submit" }, "Sign in");
+  const form = h("form.form", { onsubmit: async (e) => {
+    e.preventDefault();
+    err.clear();
+    const value = token.value.trim();
+    if (!value) return err.show("Enter the admin token.");
+    await busy(submit, async () => {
+      const res = await fetch("/admin/settings", { headers: { Authorization: `Bearer ${value}` } }).catch(() => null);
+      if (!res) return err.show("Can't reach the gateway. Is it running?");
+      if (!res.ok) return err.show(res.status === 401 ? "That token isn't right." : `The gateway answered ${res.status}.`);
+      saveToken(value);
+      if (!location.hash) location.hash = "#/overview";
+      render();
+    });
+  } }, err, field("Admin token", token, "It's ADMIN_TOKEN in the gateway's .env file."), submit);
+  root().className = "";
+  root().replaceChildren(h("div.login", h("section.card", h("div.card-body",
+    h("div.brand", h("div.brand-mark", icon("gate")), h("div", h("h1", "Agent Gateway"), h("div.brand-sub", "Admin console"))),
+    form))));
+}
+
+const ROUTES = [
+  [/^\/overview$/, () => pageOverview()],
+  [/^\/agents$/, () => pageAgents()],
+  [/^\/agents\/([a-z0-9-]+)$/, (m) => pageAgent(m[1])],
+  [/^\/mandates$/, () => pageMandates()],
+  [/^\/mandates\/([a-z0-9-]+)$/, (m) => pageMandate(m[1])],
+  [/^\/usage$/, (m, q) => pageUsage(q)],
+  [/^\/policy$/, () => pagePolicy()],
+  [/^\/activity$/, () => pageActivity()],
+  [/^\/settings$/, () => pageSettings()],
+];
+
+function parseHash() {
+  const raw = location.hash.replace(/^#/, "") || "/overview";
+  const [path, qs] = raw.split("?");
+  return { path, query: new URLSearchParams(qs || "") };
+}
+
+/** Render the current route. quiet = keep the current page on screen while loading (after a change). */
+async function render(quiet = false) {
+  if (!store.token) return renderLogin();
+  if (!document.getElementById("page")) {
+    root().className = "";
+    root().replaceChildren(shell());
+  }
+  const { path, query } = parseHash();
+  const section = path.split("/")[1];
+  document.querySelectorAll("[data-nav]").forEach((a) =>
+    a.dataset.nav === section ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current"));
+  const page = document.getElementById("page");
+  const route = ROUTES.find(([re]) => re.test(path));
+  const seq = ++renderSeq;
+  if (!quiet) page.replaceChildren(h("div.skeleton"), h("div.skeleton"));
+  try {
+    if (!route) throw new ApiError(404, "NOT_FOUND", "This page doesn't exist.");
+    const view = await route[1](path.match(route[0]), query);
+    if (seq !== renderSeq) return;
+    page.replaceChildren(...[view].flat().filter(Boolean));
+    document.title = `${(NAV.find(([id]) => id === section) || [, "Admin"])[1]} · Agent Gateway`;
+    if (!quiet) window.scrollTo(0, 0);
+  } catch (e) {
+    if (seq !== renderSeq || e.status === 401) return;
+    page.replaceChildren(errorCard(e, () => render()));
+  }
+}
+const refresh = () => render(true);
+const go = (hash) => { location.hash = hash; };
+
+// ------------------------------------------------------------------ overview
+function kpi(label, value, foot) {
+  return h("section.card.kpi", h("div.label", label), h("div.value", value), foot && h("div.foot", foot));
+}
+
+function attentionItems(o) {
+  const items = [];
+  const add = (level, t, s, href) => items.push({ level, t, s, href });
+  for (const a of o.agents) {
+    if (a.status !== "active") add(a.status === "revoked" ? "danger" : "warn", `${a.name} is ${a.status}`, "All its requests are blocked.", `#/agents/${a.id}`);
+    else if (a.used_pct >= 100) add("danger", `${a.name} has used its whole monthly budget`, "New requests are blocked until the budget is raised or the month resets.", `#/agents/${a.id}`);
+    else if (a.used_pct >= 80) add("warn", `${a.name} has used ${Math.round(a.used_pct)}% of its budget`, `${money(a.spent, a.budget_currency)} of ${money(a.budget, a.budget_currency)}`, `#/agents/${a.id}`);
+    if (a.status === "active" && !a.token_issued) add("info", `${a.name} has no access token`, "Issue one so the agent can make calls.", `#/agents/${a.id}`);
+    if (a.status === "active" && !a.mandates.length) add("info", `${a.name} isn't assigned to any mandate`, "It can't make calls until it is.", `#/agents/${a.id}`);
+  }
+  for (const m of o.mandates) {
+    if (m.status !== "active") add("warn", `Mandate ${m.name} is suspended`, "Every agent's requests under it are blocked.", `#/mandates/${m.id}`);
+    else if (m.used_pct >= 100) add("danger", `Mandate ${m.name} has used its whole monthly budget`, "All its agents are blocked.", `#/mandates/${m.id}`);
+    else if (m.used_pct >= 80) add("warn", `Mandate ${m.name} has used ${Math.round(m.used_pct)}% of its budget`, `${money(m.spent, m.budget_currency)} of ${money(m.budget, m.budget_currency)}`, `#/mandates/${m.id}`);
+  }
+  const c = o.charged_without_answer;
+  if (c.count) add("warn", `${c.count} model call${c.count > 1 ? "s were" : " was"} charged without an answer this month`,
+    `Timed out or abandoned, so the reserved amount was charged: ${money(c.cost_usd)}.`, "#/usage?outcome=timeout");
+  return items;
+}
+
+async function pageOverview() {
+  const [o, daily] = await Promise.all([api("GET", "/admin/overview"), api("GET", "/admin/usage/daily?days=30")]);
+  const rate = Number(o.usd_inr_rate);
+  const activeAgents = o.agents.filter((a) => a.status === "active").length;
+  const items = attentionItems(o);
+  const top = [...o.agents].sort((a, b) => Number(b.spent_usd) - Number(a.spent_usd)).slice(0, 6);
+  return [
+    pageHead({ title: "Overview", sub: `${monthName(o.month)} budget month · budgets reset on ${nextReset(o.month)} (India time)` }),
+    h("div.kpis",
+      kpi("Spent this month", money(o.month_cost_usd), `≈ ${money(Number(o.month_cost_usd) * rate, "INR")} at ₹${rate} per $1`),
+      kpi("Charged calls this month", int(o.month_requests), `${int(o.today.ok)} answered today`),
+      kpi("Blocked today", int(o.today.denied), o.today.failed ? `${int(o.today.failed)} failed today` : "Stopped before reaching a model"),
+      kpi("Active agents", `${activeAgents} of ${o.agents.length}`, `${o.mandates.filter((m) => m.status === "active").length} of ${o.mandates.length} mandates active`)),
+    h("div.grid-2",
+      dailyChartCard(daily),
+      card({ title: "Needs attention", hint: items.length ? `${items.length} item${items.length > 1 ? "s" : ""}` : null, flush: true,
+        body: items.length
+          ? h("div.list", items.map((it) => h("div.list-item", h("span", { class: `dot ${it.level}` }),
+            h("div", h("div.t", it.t), h("div.s", it.s)), h("a.btn.sm", { href: it.href }, "Open"))))
+          : emptyState("All clear", "No agent or mandate needs attention.") })),
+    card({ title: "Agents by spend this month", actions: h("a.btn.sm", { href: "#/agents" }, "All agents", icon("arrow")), flush: true,
+      body: table([
+        { label: "Agent", render: (a) => h("div", h("a.cell-title", { href: `#/agents/${a.id}` }, a.name), h("div.cell-sub", a.id)) },
+        { label: "Status", render: (a) => statusPill(a.status) },
+        { label: "This month", render: (a) => meter(a) },
+        { label: "Last call", render: (a) => h("span.muted", ago(a.last_request_at)) },
+      ], top, { onRow: (a) => go(`#/agents/${a.id}`), empty: emptyState("No agents yet", "Create an agent to get started.", h("a.btn.primary", { href: "#/agents" }, "Go to agents")) }) }),
+  ];
+}
+
+// ------------------------------------------------------------------ agents
+async function pageAgents() {
+  const [agents, mandates] = await Promise.all([api("GET", "/admin/agents"), api("GET", "/admin/mandates")]);
+  const names = Object.fromEntries(mandates.map((m) => [m.id, m.name]));
+  return [
+    pageHead({ title: "Agents", sub: "Each agent has its own access token, monthly budget and on/off switch.",
+      actions: h("button.btn.primary", { type: "button", onclick: () => openCreateAgent(mandates) }, icon("plus"), "New agent") }),
+    card({ flush: true, body: table([
+      { label: "Agent", render: (a) => h("div", h("a.cell-title", { href: `#/agents/${a.id}` }, a.name), h("div.cell-sub", a.id)) },
+      { label: "Status", render: (a) => statusPill(a.status) },
+      { label: "Budget this month", render: (a) => meter(a) },
+      { label: "Rate limit", render: (a) => (a.rpm_limit ? `${int(a.rpm_limit)}/min` : h("span.faint", "None")) },
+      { label: "Mandates", render: (a) => chips(a.mandates.map((id) => names[id] || id), { text: true }) },
+      { label: "Token", render: (a) => (a.token_issued ? h("span.pill.ok.plain", "Issued") : h("span.pill.warn.plain", "Not issued")) },
+      { label: "Last call", render: (a) => h("span.muted", ago(a.last_request_at)) },
+    ], agents, { onRow: (a) => go(`#/agents/${a.id}`),
+      empty: emptyState("No agents yet", "An agent is any program that calls models through the gateway.",
+        h("button.btn.primary", { type: "button", onclick: () => openCreateAgent(mandates) }, icon("plus"), "New agent")) }) }),
+  ];
+}
+
+function openCreateAgent(mandates) {
+  const m = modal({ title: "New agent", sub: "The agent gets its own access token. You'll see it once, right after creating." });
+  const name = input({ placeholder: "e.g. ResearchOS", maxlength: "200" });
+  const id = input({ class: "mono", placeholder: "researchos", maxlength: "64" });
+  let idEdited = false;
+  name.addEventListener("input", () => { if (!idEdited) id.value = slugify(name.value); });
+  id.addEventListener("input", () => { idEdited = true; });
+  const budget = budgetInput("10", "USD");
+  const rpm = input({ type: "number", min: "1", step: "1", placeholder: "No limit" });
+  const checks = mandates.map((md) => h("label.check", h("input", { type: "checkbox", value: md.id }), h("span", md.name), h("span.cell-sub", md.id)));
+  const err = formError();
+  const submit = h("button.btn.primary", { type: "submit", form: "create-agent" }, "Create agent");
+  append(m.body, h("form.form", { id: "create-agent", onsubmit: async (e) => {
+    e.preventDefault();
+    err.clear();
+    if (!name.value.trim()) return err.show("Give the agent a name.");
+    if (!/^[a-z0-9-]{1,64}$/.test(id.value)) return err.show("The ID can only use lowercase letters, numbers and dashes.");
+    await busy(submit, async () => {
+      try {
+        await api("POST", "/admin/agents", { id: id.value, name: name.value.trim(), ...budget.get(), rpm_limit: Number(rpm.value) || 0 });
+        const chosen = checks.map((c) => c.querySelector("input")).filter((c) => c.checked).map((c) => c.value);
+        for (const mid of chosen) await api("PUT", `/admin/agents/${id.value}/mandates/${mid}`);
+        const { token } = await api("POST", `/admin/agents/${id.value}/token`);
+        m.close();
+        go(`#/agents/${id.value}`);
+        showToken(id.value, token, chosen);
+      } catch (ex) { err.show(ex.message); }
+    });
+  } },
+  err,
+  h("div.row", field("Name", name), field("ID", id, "Lowercase, numbers and dashes. Can't be changed later.")),
+  h("div.field", h("span.label", "Monthly budget"), budget.el, h("div.help", "Resets on the 1st of every month (India time).")),
+  field("Rate limit (calls per minute)", rpm, "Optional. Protects against runaway loops."),
+  h("div.field", h("span.label", "Mandates"), mandates.length ? h("div.check-list", checks) : h("div.help", "No mandates yet. You can assign one later."))));
+  append(m.foot, h("button.btn", { type: "button", onclick: m.close }, "Cancel"), submit);
+}
+
+function showToken(agentId, token, mandateIds) {
+  const m = modal({ title: "Access token", sub: `For agent ${agentId}`, wide: true });
+  const base = location.origin;
+  append(m.body,
+    callout("warn", h("strong", "Copy it now. "), "It won't be shown again. The gateway only keeps a fingerprint of it."),
+    h("div.secret-box", token),
+    h("div", h("button.btn", { type: "button", onclick: () => copyText(token) }, icon("copy"), "Copy token")),
+    h("div.field", h("span.label", "How the agent connects"),
+      h("div.help", "Use any OpenAI-compatible client. The token is the API key; the base URL picks the mandate."),
+      mandateIds.length
+        ? mandateIds.map((mid) => h("div.field", h("span.help", `Base URL for mandate ${mid}`), copyRow(`${base}/m/${mid}/v1`, "base URL")))
+        : h("div.help", "Assign the agent to a mandate to get its base URL.")));
+  append(m.foot, h("button.btn.primary", { type: "button", onclick: m.close }, "Done"));
+}
+
+// ------------------------------------------------------------------ shared detail cards
+/** Monthly budget card for an agent or mandate. kind: "agents" | "mandates" */
+function budgetCard(kind, v, rate) {
+  const month = currentMonth();
+  const body = h("div.form");
+  const remaining = Math.max(0, Number(v.budget) - Number(v.spent) - Number(v.reserved));
+  const view = () => body.replaceChildren(...[
+    h("div.big-number", h("strong", money(v.spent, v.budget_currency)), h("span.muted", `spent of ${money(v.budget, v.budget_currency)} this month`)),
+    meter(v, true),
+    h("div.facts",
+      h("div.fact", h("div.k", "Remaining"), h("div.v", money(remaining, v.budget_currency))),
+      h("div.fact", h("div.k", "Held for calls in progress"), h("div.v", money(v.reserved, v.budget_currency))),
+      h("div.fact", h("div.k", "Resets on"), h("div.v", nextReset(month)))),
+    v.budget_currency === "INR" && h("div.help", `Spend is billed in USD (${money(v.spent_usd)}) and converted at ₹${rate} per $1. Change the rate in Settings.`),
+  ].filter(Boolean));
+  const edit = () => {
+    const b = budgetInput(String(Number(v.budget)), v.budget_currency);
+    const err = formError();
+    const save = h("button.btn.primary", { type: "submit" }, "Save budget");
+    body.replaceChildren(h("form.form", { onsubmit: async (e) => {
+      e.preventDefault();
+      err.clear();
+      await busy(save, async () => {
+        try {
+          await api("PATCH", `/admin/${kind}/${v.id}`, b.get());
+          toast("Budget updated. It applies to the next request.");
+          refresh();
+        } catch (ex) { err.show(ex.message); }
+      });
+    } }, err, h("div.field", h("span.label", "Monthly budget"), b.el,
+      h("div.help", "Lowering it below what's already spent blocks new requests until next month.")),
+    h("div.form-actions", h("button.btn", { type: "button", onclick: view }, "Cancel"), save)));
+    b.amount.focus();
+  };
+  view();
+  return card({ title: "Monthly budget", hint: `${monthName(month)} · India time`,
+    actions: h("button.btn.sm", { type: "button", onclick: edit }, "Edit budget"), body });
+}
+
+const CHANGE_TEXT = {
+  agent_created: "Agent created", agent_updated: "Agent updated", token_issued: "Token issued", token_rotated: "Token rotated",
+  mandate_created: "Mandate created", mandate_updated: "Mandate updated", assigned: "Assigned to mandate",
+  unassigned: "Removed from mandate", policy_updated: "Policy updated", settings_updated: "Settings updated",
+};
+const FIELD_TEXT = {
+  status: "Status", name: "Name", description: "Description", budget_limit_micros: "Budget", budget_currency: "Currency",
+  rpm_limit: "Rate limit", allowed_models: "Models", default_max_tokens: "Default max tokens", fallback_enabled: "Fallback",
+  usd_inr_rate: "USD→INR rate",
+};
+function fieldValue(key, v) {
+  if (v == null) return key === "rpm_limit" ? "none" : "—";
+  if (key === "budget_limit_micros") return String(Number(v) / 1e6);
+  if (key === "allowed_models") return v.length ? v.join(" → ") : "none";
+  if (key === "fallback_enabled") return v ? "on" : "off";
+  return String(v);
+}
+function changeDetails(e) {
+  const d = e.detail || {};
+  if (d.changed) return Object.entries(d.changed).map(([k, c]) =>
+    h("div", h("span.muted", `${FIELD_TEXT[k] || k}: `), `${fieldValue(k, c.before)} → ${fieldValue(k, c.after)}`));
+  if (e.decision === "policy_updated") return h("div", `${d.from} → ${d.to}`, d.note ? h("span.muted", ` · ${d.note}`) : null);
+  if (d.name) return h("div.muted", `${d.name}${d.budget ? ` · budget ${d.budget} ${d.currency || ""}` : ""}`);
+  return null;
+}
+function activityList(events) {
+  if (!events.length) return emptyState("No changes yet");
+  return h("div.list", events.map((e) => h("div.list-item", h("span.dot.info"),
+    h("div", h("div.t", CHANGE_TEXT[e.decision] || e.decision), h("div.s", changeDetails(e))), h("span.faint", when(e.at)))));
+}
+
+// ------------------------------------------------------------------ agent detail
+async function pageAgent(id) {
+  const [a, mandates, daily, recent, events, settings] = await Promise.all([
+    api("GET", `/admin/agents/${id}`), api("GET", "/admin/mandates"), api("GET", `/admin/usage/daily?days=30&agent=${id}`),
+    api("GET", `/admin/usage?agent=${id}&limit=8`), api("GET", `/admin/audit?agent=${id}&limit=8`), api("GET", "/admin/settings")]);
+  const names = Object.fromEntries(mandates.map((m) => [m.id, m.name]));
+
+  const setStatus = async (to) => {
+    if (to === "revoked" && !(await confirmDialog({ title: `Revoke ${a.name}?`, danger: true, confirm: "Revoke agent",
+      message: "Its token stops working immediately and every request is blocked. You can restore it later." }))) return refresh();
+    try {
+      await api("PATCH", `/admin/agents/${id}`, { status: to });
+      toast(to === "active" ? `${a.name} is active again.` : `${a.name} is ${to}. New requests are blocked.`);
+    } catch (ex) { toast(ex.message, "error"); }
+    refresh();
+  };
+
+  const rotate = async () => {
+    if (a.token_issued && !(await confirmDialog({ title: "Rotate token?", confirm: "Rotate token", danger: true,
+      message: "The current token stops working immediately. Put the new one in the agent's configuration." }))) return;
+    try {
+      const { token } = await api("POST", `/admin/agents/${id}/token`);
+      showToken(id, token, a.mandates);
+      refresh();
+    } catch (ex) { toast(ex.message, "error"); }
+  };
+
+  const assignToggle = (md) => toggle(md.name, a.mandates.includes(md.id), async (on) => {
+    try {
+      await api(on ? "PUT" : "DELETE", `/admin/agents/${id}/mandates/${md.id}`);
+      toast(on ? `Assigned to ${md.name}.` : `Removed from ${md.name}. Its requests there are blocked.`);
+    } catch (ex) { toast(ex.message, "error"); }
+    refresh();
+  });
+
+  const rpm = input({ type: "number", min: "1", step: "1", placeholder: "No limit", value: a.rpm_limit ?? "" });
+  const saveRpm = h("button.btn", { type: "submit" }, "Save");
+  const name = input({ value: a.name, maxlength: "200" });
+  const saveName = h("button.btn", { type: "submit" }, "Save");
+  const patch = (btn, body, msg) => busy(btn, async () => {
+    try { await api("PATCH", `/admin/agents/${id}`, body); toast(msg); refresh(); } catch (ex) { toast(ex.message, "error"); }
+  });
+
+  return [
+    pageHead({
+      crumbs: [h("a", { href: "#/agents" }, "Agents"), " / "],
+      title: a.name, badge: statusPill(a.status),
+      sub: [h("span.mono", a.id), ` · last call ${ago(a.last_request_at).toLowerCase()}`],
+      actions: segmented([["active", "Active", "ok"], ["suspended", "Suspended", "warn"], ["revoked", "Revoked", "danger"]],
+        a.status, setStatus, "Agent status"),
+    }),
+    a.status !== "active" && callout(a.status === "revoked" ? "danger" : "warn",
+      h("strong", `This agent is ${a.status}. `), "Every request it makes is blocked before reaching a model."),
+    h("div.grid-2",
+      h("div.stack",
+        budgetCard("agents", a, settings.usd_inr_rate),
+        dailyChartCard(daily, "Daily spend"),
+        card({ title: "Recent calls", actions: h("a.btn.sm", { href: `#/usage?agent=${id}` }, "All calls", icon("arrow")), flush: true,
+          body: usageTable(recent, { agent: false, compact: true }) })),
+      h("div.stack",
+        card({ title: "Access token", hint: "How this agent signs in to the gateway",
+          actions: h("button.btn.sm", { type: "button", onclick: rotate }, icon("key"), a.token_issued ? "Rotate token" : "Issue token"),
+          body: [
+            a.token_issued ? h("div", h("span.pill.ok.plain", "Issued"), h("span.muted", " Only a fingerprint is stored; the token itself can't be shown again."))
+              : callout("warn", "No token yet. Issue one so the agent can make calls."),
+            a.mandates.length
+              ? a.mandates.map((mid) => h("div.field", h("span.help", `Base URL for ${names[mid] || mid}`), copyRow(`${location.origin}/m/${mid}/v1`, "base URL")))
+              : h("div.help", "Assign a mandate below to get a base URL."),
+          ] }),
+        card({ title: "Mandates", hint: "What this agent may work on. Each mandate has its own models and budget.",
+          body: mandates.length ? h("div.check-list", mandates.map((md) => h("div.check", assignToggle(md),
+            h("a.cell-sub", { href: `#/mandates/${md.id}` }, md.id)))) : h("div.help", "No mandates yet. Create one under Mandates.") }),
+        card({ title: "Rate limit", hint: "Model calls per minute, including fallback attempts",
+          body: h("form.row", { onsubmit: (e) => { e.preventDefault(); patch(saveRpm, { rpm_limit: Number(rpm.value) || 0 }, "Rate limit saved."); } },
+            field("Calls per minute", rpm, "Leave empty for no limit."), h("div.field", h("span.label", " "), saveRpm)) }),
+        card({ title: "Details",
+          body: h("form.row", { onsubmit: (e) => { e.preventDefault(); patch(saveName, { name: name.value.trim() }, "Name saved."); } },
+            field("Name", name), h("div.field", h("span.label", " "), saveName)) }),
+        card({ title: "Recent changes", flush: true, body: activityList(events) }))),
+  ];
+}
+
+/** Usage records table. opts: { agent: show agent column, compact } */
+function usageTable(rows, { agent = true, mandate = true, compact = false } = {}) {
+  const cols = [
+    { label: "Time", render: (r) => h("span.num", when(r.at)) },
+    agent && { label: "Agent", render: (r) => h("a", { href: `#/agents/${r.agent_id}` }, r.agent_id) },
+    mandate && !compact && { label: "Mandate", render: (r) => (r.mandate_id ? h("span.mono", r.mandate_id) : "—") },
+    { label: "Model", render: (r) => {
+      if (!r.model_requested) return h("span.faint", "—");
+      if (r.model_served && r.model_served !== r.model_requested) {
+        return h("div", h("div.mono", r.model_served), h("div.cell-sub", `fallback from ${r.model_requested}`));
+      }
+      return h("span.mono", r.model_requested);
+    } },
+    { label: "Result", render: (r) => h("div", outcomePill(r.outcome), r.reason_code && h("div.cell-sub", reasonText(r.reason_code))) },
+    !compact && { label: "Tokens in / out", align: "r", render: (r) => (r.prompt_tokens == null ? h("span.faint", "—") : h("span.num", `${int(r.prompt_tokens)} / ${int(r.completion_tokens)}`)) },
+    { label: "Cost", align: "r", render: (r) => h("span.num", Number(r.cost_usd) ? money(r.cost_usd) : "—") },
+    !compact && { label: "Took", align: "r", render: (r) => h("span.num.muted", r.latency_ms == null ? "—" : r.latency_ms < 1000 ? `${r.latency_ms} ms` : `${(r.latency_ms / 1000).toFixed(1)} s`) },
+  ].filter(Boolean);
+  return table(cols, rows, { empty: emptyState("No calls yet", "Calls appear here as soon as the agent makes them.") });
+}
+
+// ------------------------------------------------------------------ mandates
+/** Ordered model list editor. The first model is the primary; the rest are tried in order when it's busy. */
+function modelOrderEditor(initial, models) {
+  let list = [...initial];
+  const priceOf = Object.fromEntries(models.map((m) => [m.model, m]));
+  const el = h("div.form");
+  const draw = () => {
+    const rest = models.map((m) => m.model).filter((m) => !list.includes(m));
+    const pick = select([["", rest.length ? "Choose a model…" : "All models added"], ...rest.map((m) => [m, m])], "", { "aria-label": "Model to add" });
+    const move = (i, d) => { [list[i], list[i + d]] = [list[i + d], list[i]]; draw(); };
+    el.replaceChildren(
+      list.length ? h("ol.order-list", { "aria-label": "Allowed models in fallback order" }, list.map((m, i) => {
+        const p = priceOf[m];
+        return h("li.order-item", h("span.idx", String(i + 1)),
+          h("div", h("div.name", m), h("div.role", [i === 0 ? "Primary" : `Fallback ${i}`,
+            p ? ` · $${Number(p.input_usd_per_1m)} in / $${Number(p.output_usd_per_1m)} out per 1M tokens` : " · not configured in LiteLLM"])),
+          h("div.tools",
+            h("button.btn.ghost.icon", { type: "button", "aria-label": `Move ${m} up`, disabled: i === 0, onclick: () => move(i, -1) }, icon("up")),
+            h("button.btn.ghost.icon", { type: "button", "aria-label": `Move ${m} down`, disabled: i === list.length - 1, onclick: () => move(i, 1) }, icon("down")),
+            h("button.btn.ghost.icon", { type: "button", "aria-label": `Remove ${m}`, onclick: () => { list = list.filter((x) => x !== m); draw(); } }, icon("x"))));
+      })) : h("div.help", "No models yet. Agents can't make calls under this mandate until you add one."),
+      h("div.input-group", pick, h("button.btn", { type: "button", disabled: !rest.length, onclick: () => {
+        if (pick.value) { list.push(pick.value); draw(); }
+      } }, icon("plus"), "Add")));
+  };
+  draw();
+  return { el, get: () => [...list] };
+}
+
+async function pageMandates() {
+  const [mandates, models] = await Promise.all([api("GET", "/admin/mandates"), api("GET", "/admin/models")]);
+  return [
+    pageHead({ title: "Mandates", sub: "A mandate is a piece of work: which models may be used for it, in what order, and its monthly budget.",
+      actions: h("button.btn.primary", { type: "button", onclick: () => openCreateMandate(models) }, icon("plus"), "New mandate") }),
+    card({ flush: true, body: table([
+      { label: "Mandate", render: (m) => h("div", h("a.cell-title", { href: `#/mandates/${m.id}` }, m.name), h("div.cell-sub", m.id)) },
+      { label: "Status", render: (m) => statusPill(m.status) },
+      { label: "Budget this month", render: (m) => meter(m) },
+      { label: "Models (fallback order)", render: (m) => chips(m.allowed_models, { lead: true, arrows: m.fallback_enabled }) },
+      { label: "Agents", align: "r", render: (m) => h("span.num", int(m.agents.length)) },
+    ], mandates, { onRow: (m) => go(`#/mandates/${m.id}`),
+      empty: emptyState("No mandates yet", "Create one, then assign agents to it.",
+        h("button.btn.primary", { type: "button", onclick: () => openCreateMandate(models) }, icon("plus"), "New mandate")) }) }),
+  ];
+}
+
+function openCreateMandate(models) {
+  const m = modal({ title: "New mandate", sub: "Agents assigned to it can use only these models, within its monthly budget.", wide: true });
+  const name = input({ placeholder: "e.g. ResearchOS development", maxlength: "200" });
+  const id = input({ class: "mono", placeholder: "researchos-dev", maxlength: "64" });
+  let idEdited = false;
+  name.addEventListener("input", () => { if (!idEdited) id.value = slugify(name.value); });
+  id.addEventListener("input", () => { idEdited = true; });
+  const description = h("textarea.textarea", { maxlength: "2000", rows: "2", placeholder: "What is this mandate for? (optional)" });
+  const budget = budgetInput("10", "USD");
+  const order = modelOrderEditor([], models);
+  const maxTokens = input({ type: "number", min: "1", max: "65536", step: "1", value: "4096" });
+  const fallback = toggle("Try the next model when one is busy", true);
+  const err = formError();
+  const submit = h("button.btn.primary", { type: "submit", form: "create-mandate" }, "Create mandate");
+  append(m.body, h("form.form", { id: "create-mandate", onsubmit: async (e) => {
+    e.preventDefault();
+    err.clear();
+    if (!name.value.trim()) return err.show("Give the mandate a name.");
+    if (!/^[a-z0-9-]{1,64}$/.test(id.value)) return err.show("The ID can only use lowercase letters, numbers and dashes.");
+    await busy(submit, async () => {
+      try {
+        await api("POST", "/admin/mandates", { id: id.value, name: name.value.trim(), description: description.value.trim(),
+          ...budget.get(), allowed_models: order.get(), default_max_tokens: Number(maxTokens.value) || 4096,
+          fallback_enabled: fallback.input.checked });
+        m.close();
+        toast("Mandate created. Assign agents to it.");
+        go(`#/mandates/${id.value}`);
+      } catch (ex) { err.show(ex.message); }
+    });
+  } },
+  err,
+  h("div.row", field("Name", name), field("ID", id, "Part of the agent's base URL. Can't be changed later.")),
+  field("Description", description),
+  h("div.field", h("span.label", "Monthly budget"), budget.el, h("div.help", "Shared by every agent on this mandate. Each agent also has its own budget.")),
+  h("div.field", h("span.label", "Models"), h("div.help", "The first is the primary. If it's busy, the next ones are tried in order."), order.el),
+  h("div.row", field("Default answer limit (tokens)", maxTokens, "Used when an agent doesn't set max_tokens. Lower = smaller budget holds."),
+    h("div.field", h("span.label", "Fallback"), fallback))));
+  append(m.foot, h("button.btn", { type: "button", onclick: m.close }, "Cancel"), submit);
+}
+
+async function pageMandate(id) {
+  const [md, agents, models, daily, recent, events, settings] = await Promise.all([
+    api("GET", `/admin/mandates/${id}`), api("GET", "/admin/agents"), api("GET", "/admin/models"),
+    api("GET", `/admin/usage/daily?days=30&mandate=${id}`), api("GET", `/admin/usage?mandate=${id}&limit=8`),
+    api("GET", `/admin/audit?mandate=${id}&limit=8`), api("GET", "/admin/settings")]);
+
+  const setStatus = async (to) => {
+    if (to === "suspended" && !(await confirmDialog({ title: `Suspend ${md.name}?`, confirm: "Suspend mandate", danger: true,
+      message: `Every request under this mandate is blocked, for all ${md.agents.length} assigned agent(s).` }))) return refresh();
+    try {
+      await api("PATCH", `/admin/mandates/${id}`, { status: to });
+      toast(to === "active" ? `${md.name} is active again.` : `${md.name} is suspended.`);
+    } catch (ex) { toast(ex.message, "error"); }
+    refresh();
+  };
+
+  const order = modelOrderEditor(md.allowed_models, models);
+  const fallback = toggle("Try the next model when one is busy", md.fallback_enabled);
+  const maxTokens = input({ type: "number", min: "1", max: "65536", step: "1", value: md.default_max_tokens });
+  const saveModels = h("button.btn.primary", { type: "submit" }, "Save models");
+  const modelsErr = formError();
+
+  const assigned = agents.filter((a) => md.agents.includes(a.id));
+  const unassigned = agents.filter((a) => !md.agents.includes(a.id));
+  const addAgent = select([["", unassigned.length ? "Choose an agent…" : "All agents assigned"], ...unassigned.map((a) => [a.id, a.name])], "", { "aria-label": "Agent to assign" });
+  const assign = async (agentId, on) => {
+    try {
+      await api(on ? "PUT" : "DELETE", `/admin/agents/${agentId}/mandates/${id}`);
+      toast(on ? "Agent assigned." : "Agent removed. Its requests under this mandate are blocked.");
+    } catch (ex) { toast(ex.message, "error"); }
+    refresh();
+  };
+
+  const name = input({ value: md.name, maxlength: "200" });
+  const description = h("textarea.textarea", { maxlength: "2000", rows: "2", value: md.description });
+  const saveDetails = h("button.btn", { type: "submit" }, "Save details");
+
+  return [
+    pageHead({ crumbs: [h("a", { href: "#/mandates" }, "Mandates"), " / "], title: md.name, badge: statusPill(md.status),
+      sub: [h("span.mono", id), md.description ? ` · ${md.description}` : ""],
+      actions: segmented([["active", "Active", "ok"], ["suspended", "Suspended", "warn"]], md.status, setStatus, "Mandate status") }),
+    md.status !== "active" && callout("warn", h("strong", "This mandate is suspended. "), "Every request under it is blocked."),
+    h("div.grid-2",
+      h("div.stack",
+        budgetCard("mandates", md, settings.usd_inr_rate),
+        dailyChartCard(daily, "Daily spend"),
+        card({ title: "Recent calls", actions: h("a.btn.sm", { href: `#/usage?mandate=${id}` }, "All calls", icon("arrow")), flush: true,
+          body: usageTable(recent, { mandate: false, compact: true }) })),
+      h("div.stack",
+        card({ title: "Models", hint: "Only these models can be used. Order = fallback order.",
+          body: h("form.form", { onsubmit: async (e) => {
+            e.preventDefault();
+            modelsErr.clear();
+            await busy(saveModels, async () => {
+              try {
+                await api("PATCH", `/admin/mandates/${id}`, { allowed_models: order.get(), fallback_enabled: fallback.input.checked,
+                  default_max_tokens: Number(maxTokens.value) || 4096 });
+                toast("Models saved. They apply to the next request.");
+                refresh();
+              } catch (ex) { modelsErr.show(ex.message); }
+            });
+          } }, modelsErr, order.el, fallback,
+          field("Default answer limit (tokens)", maxTokens, "Used when an agent doesn't set max_tokens. It caps the answer length and the budget hold."),
+          h("div.form-actions", saveModels)) }),
+        card({ title: "Agents", hint: `${assigned.length} assigned`, flush: true, body: [
+          assigned.length ? h("div.list", assigned.map((a) => h("div.list-item", h("span", { class: `dot ${STATUS_TONE[a.status]}` }),
+            h("div", h("a.t", { href: `#/agents/${a.id}` }, a.name), h("div.s", `${titleCase(a.status)} · ${money(a.spent, a.budget_currency)} spent this month`)),
+            h("button.btn.sm", { type: "button", onclick: () => assign(a.id, false) }, "Remove")))) : emptyState("No agents assigned"),
+          h("div.toolbar", h("div.input-group", addAgent, h("button.btn", { type: "button", disabled: !unassigned.length,
+            onclick: () => addAgent.value && assign(addAgent.value, true) }, icon("plus"), "Assign"))),
+        ] }),
+        card({ title: "Details", body: h("form.form", { onsubmit: (e) => {
+          e.preventDefault();
+          busy(saveDetails, async () => {
+            try {
+              await api("PATCH", `/admin/mandates/${id}`, { name: name.value.trim(), description: description.value.trim() });
+              toast("Details saved."); refresh();
+            } catch (ex) { toast(ex.message, "error"); }
+          });
+        } }, field("Name", name), field("Description", description), h("div.form-actions", saveDetails)) }),
+        card({ title: "Recent changes", flush: true, body: activityList(events) }))),
+  ];
+}
+
+// ------------------------------------------------------------------ usage
+function setQuery(q, changes) {
+  for (const [k, v] of Object.entries(changes)) v ? q.set(k, v) : q.delete(k);
+  go(`#/usage${q.toString() ? `?${q}` : ""}`);
+}
+
+async function pageUsage(q) {
+  const tab = q.get("tab") === "monthly" ? "monthly" : "requests";
+  const tabs = h("div.tabs", { role: "tablist" },
+    [["requests", "Calls"], ["monthly", "Monthly totals"]].map(([t, label]) =>
+      h("button", { type: "button", role: "tab", "aria-selected": String(t === tab), onclick: () => setQuery(q, { tab: t === "requests" ? "" : t }) }, label)));
+  const head = pageHead({ title: "Usage", sub: "Every call an agent made through the gateway. Raw calls are kept 90 days; monthly totals are kept forever." });
+  return [head, tabs, tab === "monthly" ? await usageMonthly(q) : await usageRequests(q)];
+}
+
+async function usageRequests(q) {
+  const filters = { agent: q.get("agent") || "", mandate: q.get("mandate") || "", outcome: q.get("outcome") || "", model: q.get("model") || "" };
+  const params = new URLSearchParams(Object.entries(filters).filter(([, v]) => v));
+  const [rows, agents, mandates, models] = await Promise.all([
+    api("GET", `/admin/usage?limit=50&${params}`), api("GET", "/admin/agents"), api("GET", "/admin/mandates"), api("GET", "/admin/models")]);
+  const bar = h("div.toolbar",
+    field("Agent", select([["", "All agents"], ...agents.map((a) => [a.id, a.name])], filters.agent, { onchange: (e) => setQuery(q, { agent: e.target.value }) })),
+    field("Mandate", select([["", "All mandates"], ...mandates.map((m) => [m.id, m.name])], filters.mandate, { onchange: (e) => setQuery(q, { mandate: e.target.value }) })),
+    field("Result", select([["", "All results"], ["ok", "Answered"], ["denied", "Blocked"], ["error", "Failed"], ["timeout", "Timed out"]], filters.outcome, { onchange: (e) => setQuery(q, { outcome: e.target.value }) })),
+    field("Model", select([["", "All models"], ...models.map((m) => [m.model, m.model])], filters.model, { onchange: (e) => setQuery(q, { model: e.target.value }) })),
+    Object.values(filters).some(Boolean) && h("div.field", h("span.label", " "), h("button.btn.ghost", { type: "button", onclick: () => go("#/usage") }, "Clear filters")));
+  const holder = h("div", usageTable(rows));
+  let last = rows.length ? rows[rows.length - 1].id : null;
+  const more = h("button.btn", { type: "button", onclick: () => busy(more, async () => {
+    const next = await api("GET", `/admin/usage?limit=50&before_id=${last}&${params}`);
+    rows.push(...next);
+    last = rows.length ? rows[rows.length - 1].id : null;
+    holder.replaceChildren(usageTable(rows));
+    if (next.length < 50) more.remove();
+  }) }, "Load older calls");
+  return card({ flush: true, body: [bar, holder], foot: rows.length === 50 && h("div.toolbar", more) });
+}
+
+async function usageMonthly(q) {
+  const by = ["agent", "mandate", "model"].includes(q.get("by")) ? q.get("by") : "agent";
+  const data = await api("GET", `/admin/usage/monthly${q.get("month") ? `?month=${q.get("month")}` : ""}`);
+  const key = { agent: "agent_id", mandate: "mandate_id", model: "model" }[by];
+  const groups = {};
+  for (const r of data.rows) {
+    const g = groups[r[key]] ||= { name: r[key], requests: 0, prompt: 0, completion: 0, cost: 0 };
+    g.requests += r.requests; g.prompt += r.prompt_tokens; g.completion += r.completion_tokens; g.cost += Number(r.cost_usd);
+  }
+  const rows = Object.values(groups).sort((a, b) => b.cost - a.cost);
+  const total = rows.reduce((t, r) => ({ requests: t.requests + r.requests, prompt: t.prompt + r.prompt, completion: t.completion + r.completion, cost: t.cost + r.cost }),
+    { requests: 0, prompt: 0, completion: 0, cost: 0 });
+  const href = { agent: (n) => `#/agents/${n}`, mandate: (n) => `#/mandates/${n}`, model: null }[by];
+  const share = (r) => {
+    const track = h("div.meter-track"), fill = h("div.meter-fill");
+    fill.style.width = `${total.cost ? (r.cost / total.cost) * 100 : 0}%`;
+    track.append(fill);
+    return h("div.meter", track);
+  };
+  return card({ flush: true, body: [
+    h("div.toolbar",
+      field("Month", select(data.months.map((m) => [m, monthName(m) + (m === data.current_month ? " (current)" : "")]), data.month,
+        { onchange: (e) => setQuery(q, { month: e.target.value === data.current_month ? "" : e.target.value }) })),
+      h("div.field", h("span.label", "Group by"), segmented([["agent", "Agent"], ["mandate", "Mandate"], ["model", "Model"]], by,
+        (v) => setQuery(q, { by: v === "agent" ? "" : v }), "Group by"))),
+    table([
+      { label: titleCase(by), render: (r) => (href ? h("a.mono", { href: href(r.name) }, r.name) : h("span.mono", r.name)) },
+      { label: "Model calls", align: "r", render: (r) => h("span.num", int(r.requests)) },
+      { label: "Input tokens", align: "r", render: (r) => h("span.num", int(r.prompt)) },
+      { label: "Output tokens", align: "r", render: (r) => h("span.num", int(r.completion)) },
+      { label: "Cost", align: "r", render: (r) => h("span.num", money(r.cost)) },
+      { label: "Share of cost", render: share },
+    ], rows, {
+      empty: emptyState(`Nothing recorded for ${monthName(data.month)}`),
+      foot: ["Total", int(total.requests), int(total.prompt), int(total.completion), money(total.cost), ""],
+    }),
+  ] });
+}
+
+// ------------------------------------------------------------------ policy
+const BUILTIN_TEXT = {
+  AGENT_REVOKED: "The agent is revoked", AGENT_INACTIVE: "The agent is suspended",
+  MANDATE_NOT_ASSIGNED: "The agent isn't assigned to the mandate, or the mandate doesn't exist",
+  MANDATE_INACTIVE: "The mandate is suspended", MODEL_NOT_ALLOWED: "The model isn't in the mandate's model list",
+};
+const FACT_TEXT = { "agent.id": "Agent", "mandate.id": "Mandate", "model.name": "Model" };
+
+async function pagePolicy() {
+  const [p, agents, mandates, models] = await Promise.all([
+    api("GET", "/admin/policy"), api("GET", "/admin/agents"), api("GET", "/admin/mandates"), api("GET", "/admin/models")]);
+  let draft = p.custom.map((r) => ({ ...r, when: { ...r.when } }));
+  const dirty = () => JSON.stringify(draft) !== JSON.stringify(p.custom);
+  const seen = new Set();
+  const builtin = p.builtin.filter((r) => !seen.has(r.reason) && seen.add(r.reason));
+
+  const rulesHost = h("div");
+  const unsaved = h("div.unsaved.hidden");
+  const note = input({ placeholder: "What changed and why (optional)", maxlength: "300" });
+  const saveBtn = h("button.btn.primary", { type: "button" }, `Save as version ${p.history.length ? p.history[0].version + 1 : 1}`);
+  append(unsaved, h("strong", "Unsaved changes"), h("div.grow", note),
+    h("button.btn", { type: "button", onclick: () => { draft = p.custom.map((r) => ({ ...r, when: { ...r.when } })); drawRules(); } }, "Discard"), saveBtn);
+  saveBtn.addEventListener("click", () => busy(saveBtn, async () => {
+    try {
+      const res = await api("PUT", "/admin/policy", { rules: draft, note: note.value.trim() });
+      toast(`Saved. Policy ${res.version} applies to the next request.`);
+      refresh();
+    } catch (ex) { toast(ex.message, "error"); }
+  }));
+
+  function drawRules() {
+    rulesHost.replaceChildren(table([
+      { label: "#", render: (r) => h("span.num.faint", String(draft.indexOf(r) + 1)) },
+      { label: "Blocks a request when", render: (r) => h("div.chips", Object.entries(r.when).map(([k, v], i) =>
+        [i ? h("span.chip-sep", "and") : null, h("span.chip", `${FACT_TEXT[k] || k} = ${v}`)])) },
+      { label: "Reason code", render: (r) => h("span.code", r.reason) },
+      { label: "Message to the agent", render: (r) => h("span.muted", r.message) },
+      { label: "", align: "r", render: (r) => h("button.btn.ghost.icon", { type: "button", "aria-label": `Remove rule ${r.reason}`,
+        onclick: () => { draft = draft.filter((x) => x !== r); drawRules(); } }, icon("x")) },
+    ], draft, { empty: emptyState("No rules of your own yet", "Add one below, for example to stop one agent from using an expensive model.") }));
+    unsaved.classList.toggle("hidden", !dirty());
+  }
+  drawRules();
+
+  const cond = (fact, options) => select([["", "Any"], ...options], "", { "aria-label": FACT_TEXT[fact] });
+  const cAgent = cond("agent.id", agents.map((a) => [a.id, `${a.name} (${a.id})`]));
+  const cMandate = cond("mandate.id", mandates.map((m) => [m.id, `${m.name} (${m.id})`]));
+  const cModel = cond("model.name", models.map((m) => [m.model, m.model]));
+  const reason = input({ class: "mono", placeholder: "NO_PRO_MODELS_FOR_TESTS", maxlength: "48" });
+  reason.addEventListener("input", () => { reason.value = reason.value.toUpperCase().replace(/[^A-Z0-9_]/g, "_"); });
+  const message = input({ placeholder: "Shown to the agent in the error", maxlength: "300" });
+  const addErr = formError();
+  const addForm = h("form.form", { onsubmit: (e) => {
+    e.preventDefault();
+    addErr.clear();
+    const when = Object.fromEntries([["agent.id", cAgent.value], ["mandate.id", cMandate.value], ["model.name", cModel.value]].filter(([, v]) => v));
+    if (!Object.keys(when).length) return addErr.show("Pick at least one condition. A rule with no conditions would block everything.");
+    if (!/^[A-Z][A-Z0-9_]{2,47}$/.test(reason.value)) return addErr.show("The reason code needs 3–48 characters: capital letters, numbers and underscores, starting with a letter.");
+    if (p.builtin.some((r) => r.reason === reason.value)) return addErr.show("That reason code belongs to a built-in rule. Pick another.");
+    draft.push({ reason: reason.value, when, message: message.value.trim() || reason.value });
+    [cAgent, cMandate, cModel].forEach((s) => { s.value = ""; });
+    reason.value = ""; message.value = "";
+    drawRules();
+  } }, addErr,
+  h("div.row.three", field("Agent", cAgent), field("Mandate", cMandate), field("Model", cModel)),
+  h("div.row", field("Reason code", reason), field("Message", message)),
+  h("div.form-actions", h("button.btn", { type: "submit" }, icon("plus"), "Add rule")));
+
+  return [
+    pageHead({ title: "Policy", badge: h("span.pill.info.plain", p.version),
+      sub: "Every request is checked against these rules, top to bottom. The first rule that matches blocks it; if none match, budgets are checked next." }),
+    h("div.grid-2",
+      h("div.stack",
+        card({ title: "Your rules", hint: "Changes are saved as a new version and apply to the next request", flush: true,
+          body: [rulesHost, h("div.card-body", h("h3.subhead", "Add a rule"), addForm)], foot: unsaved })),
+      h("div.stack",
+        card({ title: "Built-in rules", hint: "Always on, checked first. They protect the on/off switches.", flush: true,
+          body: h("div.list", builtin.map((r) => h("div.list-item", icon("lock"),
+            h("div", h("div.t", BUILTIN_TEXT[r.reason] || r.message), h("div.s.mono", r.reason)), null))) }),
+        card({ title: "History", flush: true, body: p.history.length
+          ? h("div.list", p.history.map((v) => h("div.list-item", h("span.dot.info"),
+            h("div", h("div.t", `Version ${v.version}${v.version === p.number ? " (active)" : ""}`), h("div.s", `${v.rule_count} rule${v.rule_count === 1 ? "" : "s"}${v.note ? ` · ${v.note}` : ""}`)),
+            h("span.faint", when(v.created_at)))))
+          : emptyState("No versions saved yet", "Only the built-in rules are active.") }))),
+  ];
+}
+
+// ------------------------------------------------------------------ activity
+async function pageActivity() {
+  const events = await api("GET", "/admin/audit?limit=300");
+  return [
+    pageHead({ title: "Activity", sub: "Every change made in this console or the admin API. This log can't be edited or deleted by the gateway." }),
+    card({ flush: true, body: table([
+      { label: "When", render: (e) => h("span.num", when(e.at)) },
+      { label: "Change", render: (e) => h("strong", CHANGE_TEXT[e.decision] || e.decision) },
+      { label: "Agent / mandate", render: (e) => h("div.chips",
+        e.agent_id && h("a.chip", { href: `#/agents/${e.agent_id}` }, e.agent_id),
+        e.mandate_id && h("a.chip", { href: `#/mandates/${e.mandate_id}` }, e.mandate_id)) },
+      { label: "Details", render: (e) => changeDetails(e) || h("span.faint", "—") },
+    ], events, { empty: emptyState("No changes yet") }) }),
+  ];
+}
+
+// ------------------------------------------------------------------ settings
+async function pageSettings() {
+  const [s, models, health] = await Promise.all([api("GET", "/admin/settings"), api("GET", "/admin/models"),
+    fetch("/health/ready", { cache: "no-store" }).then((r) => r.json()).catch(() => ({}))]);
+  const rate = input({ type: "number", min: "1.0001", max: "1000", step: "0.01", value: s.usd_inr_rate, "aria-label": "Rupees per US dollar" });
+  const save = h("button.btn.primary", { type: "submit" }, "Save rate");
+  const err = formError();
+  const dot = (ok) => h("span", { class: `pill ${ok ? "ok" : "danger"}` }, ok ? "OK" : "Down");
+  return [
+    pageHead({ title: "Settings" }),
+    h("div.grid-2",
+      h("div.stack",
+        card({ title: "Exchange rate", hint: "Converts INR budgets to the USD that providers bill",
+          body: h("form.form", { onsubmit: async (e) => {
+            e.preventDefault();
+            err.clear();
+            await busy(save, async () => {
+              try { await api("PUT", "/admin/settings", { usd_inr_rate: rate.value }); toast("Rate saved. INR budgets use it from the next request."); refresh(); }
+              catch (ex) { err.show(ex.message); }
+            });
+          } }, err, h("div.field", h("label", { for: rate.id = "rate" }, "1 US dollar ="), h("div.input-group", h("span.addon", "₹"), rate),
+            h("div.help", s.usd_inr_rate_updated_at ? `Last changed ${when(s.usd_inr_rate_updated_at)}.` : "")),
+          h("div.form-actions", save)) }),
+        card({ title: "Models and prices", hint: "Prices come from LiteLLM's price list, per 1 million tokens", flush: true,
+          body: table([
+            { label: "Model", render: (m) => h("div", h("div.mono", m.model), m.provider && h("div.cell-sub", m.provider)) },
+            { label: "Input", align: "r", render: (m) => h("span.num", money(m.input_usd_per_1m)) },
+            { label: "Output", align: "r", render: (m) => h("span.num", money(m.output_usd_per_1m)) },
+            { label: "Max answer", align: "r", render: (m) => h("span.num", `${int(m.max_output_tokens)} tokens`) },
+            { label: "Used by", render: (m) => chips(m.mandates) },
+          ], models, { empty: emptyState("No models", "Add models in config/litellm.yaml.") }),
+          foot: h("div.toolbar", h("span.help", "To add a model or provider, edit config/litellm.yaml and put its key in .env, then restart LiteLLM. Keys are never stored in the database or shown here.")) })),
+      h("div.stack",
+        card({ title: "System", body: h("div.facts",
+          h("div.fact", h("div.k", "Database"), h("div.v", dot(health.db))),
+          h("div.fact", h("div.k", "LiteLLM"), h("div.v", dot(health.litellm))),
+          h("div.fact", h("div.k", "Prices loaded"), h("div.v", dot(health.prices))),
+          h("div.fact", h("div.k", "Budget month"), h("div.v", s.budget_timezone)),
+          h("div.fact", h("div.k", "Call records kept"), h("div.v", `${s.usage_retention_days} days`)),
+          h("div.fact", h("div.k", "Log level"), h("div.v", s.log_level))) }),
+        card({ title: "Policy", body: [h("div", "Active version ", h("span.code", s.policy_version)), h("a", { href: "#/policy" }, "Edit rules")] }),
+        card({ title: "This session", body: [h("div.help", "You're signed in with the admin token in this browser tab only."),
+          h("div", h("button.btn", { type: "button", onclick: () => signOut() }, icon("logout"), "Sign out"))] }))),
+  ];
+}
+
+// ------------------------------------------------------------------ boot
+window.addEventListener("hashchange", () => render());
+render();

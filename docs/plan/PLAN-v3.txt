@@ -1,0 +1,51 @@
+AI AGENT GATEWAY - v3 (built 2026-10-13)
+=======================================
+
+WHY
+  The product requirements after v1 (M1-M10):
+  - agents never call a model directly; mandates, kill switches, policies, budgets, allowed models and
+    fallback models per agent/mandate
+  - everything configurable in a clear admin UI
+  - tracking of what each agent and mandate spent, with lean records
+  - provider keys stored safely (a stolen database must not leak them)
+  Groups were considered and dropped: budgets, policies and mandates apply to agents.
+
+DECISIONS
+  1. Budgets stay in the gateway. LiteLLM 1.104 also has budget reservation (checked in its source:
+     proxy/spend_tracking/budget_reservation.py, no licence gate), but it knows nothing about our agents
+     and mandates, has no INR, and keeps counters in memory without Redis. We copied its estimate rules
+     instead and turned on its strict mode (fail_closed_budget_enforcement) as a second safety net on
+     the gateway's own key.
+  2. Monthly budgets, calendar month in India time (SQL budget_period()). Spend in USD; each agent's and
+     mandate's budget in USD or INR; one admin-set USD->INR rate.
+  3. Worst-case estimate for any model: bytes x highest input price that could apply + max_tokens x
+     highest output price that could apply (cache writes, reasoning, long-prompt tiers; tiers only when
+     the request has more bytes than the tier threshold).
+  4. Default answer limit per mandate (new mandates 4096; existing mandates kept at 8192).
+  5. Fallback: mandate's model list is ordered; on 429 / 503 / connection error the gateway tries the
+     models after the requested one. Each attempt passes policy and has its own hold. No fallback on
+     timeouts (240 s LiteLLM + 300 s client). LiteLLM router fallbacks are not used.
+  6. Policy: built-in rules in code (read-only), custom rules (agent / mandate / model) edited in the UI
+     and stored as numbered versions in policy_versions (append-only). config/policy.toml removed.
+  7. Per-agent rate limit (calls per minute), enforced exactly inside the reserve transaction.
+  8. Records: one usage row per request (90-day retention, hourly cleanup), usage_monthly totals kept
+     forever, audit_events only for admin changes. LiteLLM's spend log turned off (disable_spend_logs;
+     key spend still updates - verified in its source and by the e2e test).
+  9. Logs: JSON lines, LOG_LEVEL (DEBUG/INFO/WARNING), Docker rotation 5 x 10 MB. Central log store
+     flagged for deployment.
+  10. Keys: only in .env; GitHub Actions secrets -> server .env once a deploy job exists.
+  11. Admin console rebuilt as static HTML/CSS/JS (no build step, strict CSP, no external requests).
+
+BUILT (files)
+  gateway/migrations/003_v3.sql, 004_usage_backfill.sql
+  gateway/db.py      monthly roll, INR limit, rate limit, per-attempt reservations, usage, cleanup
+  gateway/policy.py  built-in + custom rules, versions
+  gateway/app.py     universal estimate, fallback loop, admin API (agents, mandates, usage, daily,
+                     monthly, overview, policy, settings, models, audit), console routes
+  gateway/ui/        index.html, app.css, app.js
+  tests/             93 pytest tests + e2e (real LiteLLM, fallback, key-spend cross-check)
+
+OPEN ITEMS
+  - Confirm whether Gemini thinking tokens can exceed max_tokens (Google docs or one approved call).
+  - Compare LiteLLM prices with the provider invoice monthly.
+  - Streaming, alerts at 80%, per-person admin logins, TLS + server deployment, SynBioAI onboarding.

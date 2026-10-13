@@ -7,6 +7,6 @@ set -euo pipefail
 cd "$(dirname "$0")/.."
 export COMPOSE_PROJECT_NAME=aigw-test COMPOSE_FILE=docker-compose.yml:docker-compose.test.yml
 export GATEWAY_PORT=18080 MOCK_PORT=19000
-docker compose build -q
+docker compose --profile tests build -q   # the tests image is behind a profile
 docker compose --profile tests run --rm tests
 [ "${1:-}" = unit ] || python3 tests/e2e_killswitch.py

@@ -25,11 +25,9 @@ services:
       OWNER_DATABASE_URL: postgresql://gateway_owner:${GATEWAY_OWNER_PASSWORD}@db:5432/gateway
       LITELLM_GATEWAY_KEY: sk-test-upstream-is-mocked
       ADMIN_TOKEN: adm_test-admin-token
-      POLICY_FILE: /config/policy.toml
       PYTHONPATH: /app
     volumes:
       - ./tests:/tests:ro
-      - ./config/policy.toml:/config/policy.toml:ro
     depends_on:
       migrate: { condition: service_completed_successfully }
     networks: [backend]

@@ -10,9 +10,10 @@ Proves, for two agents A and B sharing one mandate:
   3. revoking A denies A (403 AGENT_REVOKED) before LiteLLM / the model
   4. while the gateway is down, requests fail closed (nothing reaches the model)
   5. after a gateway restart A is still revoked
-  6. LiteLLM's own spend log contains every allowed request id and none of the denied ones
+  6. LiteLLM's own accounting agrees: the gateway key's spend rose by exactly what the gateway charged
   7. restoring A lets A work again
-  8. deployment checks: LiteLLM/Postgres not published, no secrets tracked in git, gateway holds no provider secrets
+  8. a busy model (429) falls back to the next model in the mandate's list, through the real LiteLLM
+  9. deployment checks: LiteLLM/Postgres not published, no secrets tracked in git, gateway holds no provider secrets
 """
 import json, os, pathlib, subprocess, sys, time, urllib.error, urllib.request
 
@@ -87,60 +88,66 @@ def psql(db: str, sql: str) -> str:
     return sh("docker", "compose", "exec", "-T", "db", "psql", "-U", dotenv("POSTGRES_USER"), "-d", db, "-tAc", sql).strip()
 
 
+def key_spend() -> float:
+    return float(psql("litellm", "SELECT coalesce(sum(spend), 0) FROM \"LiteLLM_VerificationToken\" WHERE key_alias='gateway'") or 0)
+
+
+def usage(agent: str | None = None, outcome: str | None = None) -> list[dict]:
+    q = "&".join(f"{k}={v}" for k, v in (("mandate", M), ("agent", agent), ("outcome", outcome)) if v)
+    return admin("GET", f"/admin/usage?limit=500&{q}")
+
+
 def main() -> int:
     print("== starting isolated test stack (aigw-test)")
     sh("docker", "compose", "up", "-d", "--build", "db", "litellm", "mock-upstream", "migrate", "gateway")
     sh(str(ROOT / "scripts/litellm-setup.sh"))
     wait_ready()
     http("POST", MOCK + "/reset")
+    key_spend_before = key_spend()
 
     print("== setup: mandate", M, "with agents", A, "and", B)
-    admin("POST", "/admin/mandates", {"id": M, "name": "E2E mandate", "budget_usd": "5", "allowed_models": ["mock-model"]})
+    admin("POST", "/admin/mandates", {"id": M, "name": "E2E mandate", "budget": "5", "allowed_models": ["mock-model", "mock-model-2"]})
     tokens = {}
     for agent in (A, B):
-        admin("POST", "/admin/agents", {"id": agent, "name": agent, "budget_usd": "1"})
+        admin("POST", "/admin/agents", {"id": agent, "name": agent, "budget": "1"})
         admin("PUT", f"/admin/agents/{agent}/mandates/{M}")
         tokens[agent] = admin("POST", f"/admin/agents/{agent}/token")["token"]
-    allowed, denied = [], []
 
     print("== 1. both agents get answers")
     for agent in (A, B):
         status, data = chat(tokens[agent])
         check(f"{agent} allowed", status == 200 and data["choices"][0]["message"]["content"] == "mock reply", f"HTTP {status}")
     check("model called exactly twice", count() == 2, f"counter={count()}")
-    audit = admin("GET", f"/admin/audit?mandate={M}&decision=settled")
-    allowed += [e["request_id"] for e in audit]
+    allowed_rows = usage(outcome="ok")
     agents = {a["id"]: a for a in admin("GET", "/admin/agents")}
     mandate = {m["id"]: m for m in admin("GET", "/admin/mandates")}[M]
-    check("spend attributed per agent", all(agents[x]["spent_micros"] > 0 for x in (A, B)),
+    check("spend attributed per agent", all(float(agents[x]["spent_usd"]) > 0 for x in (A, B)),
           f"A={agents[A]['spent_usd']} B={agents[B]['spent_usd']}")
-    check("mandate spend = A + B", mandate["spent_micros"] == agents[A]["spent_micros"] + agents[B]["spent_micros"],
+    check("mandate spend = A + B", round(float(mandate["spent_usd"]), 6) == round(float(agents[A]["spent_usd"]) + float(agents[B]["spent_usd"]), 6),
           f"mandate={mandate['spent_usd']}")
-    check("cost came from LiteLLM", all(e["cost_source"] == "litellm_header" for e in audit))
+    check("cost came from LiteLLM", len(allowed_rows) == 2 and all(r["cost_source"] == "litellm_header" for r in allowed_rows))
 
     print("== 2. withdraw A's budget")
-    admin("PATCH", f"/admin/agents/{A}", {"budget_usd": "0"})
+    admin("PATCH", f"/admin/agents/{A}", {"budget": "0"})
     before = count()
     status, data = chat(tokens[A])
-    denied.append(data.get("error", {}).get("request_id"))
     check("A denied 402 AGENT_BUDGET_EXCEEDED", status == 402 and data["error"]["code"] == "AGENT_BUDGET_EXCEEDED", f"HTTP {status}")
     check("model NOT called for A", count() == before, f"counter={count()}")
     status, _ = chat(tokens[B])
     check("B still allowed", status == 200)
     check("model called once, for B", count() == before + 1, f"counter={count()}")
-    admin("PATCH", f"/admin/agents/{A}", {"budget_usd": "1"})
+    admin("PATCH", f"/admin/agents/{A}", {"budget": "1"})
 
     print("== 3. revoke A")
     admin("PATCH", f"/admin/agents/{A}", {"status": "revoked"})
     before = count()
     status, data = chat(tokens[A])
-    denied.append(data.get("error", {}).get("request_id"))
     check("A denied 403 AGENT_REVOKED", status == 403 and data["error"]["code"] == "AGENT_REVOKED", f"HTTP {status}")
     check("model NOT called", count() == before, f"counter={count()}")
     trail = admin("GET", f"/admin/audit?agent={A}&limit=20")
-    check("audit shows revocation then denial",
+    check("activity log shows the revocation, usage shows the denial",
           any(e["decision"] == "agent_updated" and "status" in e["detail"].get("changed", {}) for e in trail)
-          and any(e["decision"] == "deny" and e["reason_code"] == "AGENT_REVOKED" and e["policy_version"] for e in trail))
+          and any(r["reason_code"] == "AGENT_REVOKED" and r["policy_version"] for r in usage(agent=A, outcome="denied")))
 
     print("== 4. gateway down: requests fail closed")
     sh("docker", "compose", "stop", "gateway")
@@ -158,18 +165,16 @@ def main() -> int:
     wait_ready()
     print(f"  (gateway ready {time.time() - t0:.0f}s after start)")
     status, data = chat(tokens[A])
-    denied.append(data.get("error", {}).get("request_id"))
     check("A still denied after restart", status == 403 and data["error"]["code"] == "AGENT_REVOKED", f"HTTP {status}")
     check("model NOT called", count() == before, f"counter={count()}")
 
-    print("== 6. LiteLLM's own spend log agrees (waiting ~15s for its batch write)")
-    allowed = [e["request_id"] for e in admin("GET", f"/admin/audit?mandate={M}&decision=settled")]
+    print("== 6. LiteLLM's own accounting agrees (waiting ~15s for its batch write)")
     time.sleep(15)
-    ids = ",".join(f"'{x}'" for x in allowed + denied if x)
-    logged = set(psql("litellm", f'SELECT request_id FROM "LiteLLM_SpendLogs" WHERE request_id IN ({ids}) '
-                                 f'UNION SELECT litellm_call_id FROM "LiteLLM_SpendLogs" WHERE litellm_call_id IN ({ids})').split())
-    check(f"all {len(allowed)} allowed requests are in LiteLLM_SpendLogs", set(allowed) <= logged, f"{len(logged & set(allowed))}/{len(allowed)}")
-    check(f"none of the {len(denied)} denied requests reached LiteLLM", not (set(denied) & logged))
+    charged = sum(float(r["cost_usd"]) for r in usage(outcome="ok"))
+    delta = key_spend() - key_spend_before
+    check("gateway key spend in LiteLLM == total charged by the gateway", abs(delta - charged) < 1e-6,
+          f"litellm={delta:.6f} gateway={charged:.6f}")
+    check("every denied request recorded, none forwarded", len(usage(outcome="denied")) == 3 and count() == before)
 
     print("== 7. restore A")
     admin("PATCH", f"/admin/agents/{A}", {"status": "active"})
@@ -177,7 +182,20 @@ def main() -> int:
     status, _ = chat(tokens[A])
     check("A allowed again", status == 200 and count() == before + 1, f"HTTP {status}, counter={count()}")
 
-    print("== 8. deployment checks")
+    print("== 8. fallback through the real LiteLLM")
+    http("POST", MOCK + "/fail", {"model": "mock-model", "status": 429, "times": 1})
+    before = count()
+    req = urllib.request.Request(f"{GW}/m/{M}/v1/chat/completions", method="POST",
+                                 data=json.dumps({"model": "mock-model", "messages": [{"role": "user", "content": "e2e"}]}).encode(),
+                                 headers={"Content-Type": "application/json", "Authorization": f"Bearer {tokens[B]}"})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        served, status = r.headers.get("x-gateway-model"), r.status
+    check("busy mock-model -> answered by mock-model-2", status == 200 and served == "mock-model-2", f"HTTP {status}, served={served}")
+    check("model called twice (busy + fallback)", count() == before + 2, f"counter={count() - before}")
+    last = usage(agent=B)[0]
+    check("one usage row, 2 attempts, fallback model recorded", last["attempts"] == 2 and last["model_served"] == "mock-model-2")
+
+    print("== 9. deployment checks")
     cfg = json.loads(subprocess.run(["docker", "compose", "-f", "docker-compose.yml", "config", "--format", "json"],
                                     cwd=ROOT, capture_output=True, text=True, check=True).stdout)
     published = {s: v.get("ports") for s, v in cfg["services"].items() if v.get("ports")}

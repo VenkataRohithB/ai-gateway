@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Call the gateway admin API. Reads ADMIN_TOKEN (and optional GATEWAY_URL) from env or ./.env.
 
-  scripts/gw_admin.py GET  /admin/summary
-  scripts/gw_admin.py POST /admin/agents '{"id":"demo-a","name":"Demo A","budget_usd":"1.00"}'
+  scripts/gw_admin.py GET  /admin/overview
+  scripts/gw_admin.py POST /admin/agents '{"id":"demo-a","name":"Demo A","budget":"1.00","budget_currency":"USD"}'
   scripts/gw_admin.py POST /admin/agents/demo-a/token --save-token .secrets/demo-a.token
   scripts/gw_admin.py PATCH /admin/agents/demo-a '{"status":"revoked"}'
 

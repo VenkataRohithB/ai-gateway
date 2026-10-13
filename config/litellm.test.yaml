@@ -19,6 +19,8 @@ general_settings:
   master_key: os.environ/LITELLM_MASTER_KEY
   database_url: os.environ/DATABASE_URL
   store_model_in_db: false
+  disable_spend_logs: true              # the gateway keeps the per-request records; key spend still updates
+  fail_closed_budget_enforcement: true  # LiteLLM refuses a call whose estimate exceeds the key's remaining backstop
 
 litellm_settings:
   turn_off_message_logging: true

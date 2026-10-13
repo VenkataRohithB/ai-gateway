@@ -77,7 +77,7 @@ Provider keys are added on the console's **Providers** page (or, for the origina
 
 | Page | What you do there |
 |---|---|
-| **Overview** | This month's spend, charged calls, blocked calls, a 30-day spend chart, and a "Needs attention" list (budgets ≥ 80%, suspended agents, calls charged without an answer, agents without a token or mandate) |
+| **Overview** | This month's spend, charged calls, blocked calls, today's calls through each gate step (where blocked calls were stopped), a 30-day spend chart, and a "Needs attention" list (budgets ≥ 80%, suspended agents, calls charged without an answer, agents without a token or mandate) |
 | **Agents** | Create agents (token shown once), switch Active / Suspended / Revoked, monthly budget in USD or INR, rate limit, rotate token, assign mandates, copy each mandate's base URL, recent calls and changes |
 | **Providers** | Add AI company keys (write-only, encrypted), add models with automatic or manual prices, remove them when nothing uses them |
 | **Mandates** | Create mandates, ordered model list (order = fallback order), fallback on/off, default answer limit, monthly budget, assign agents, suspend |
@@ -87,7 +87,15 @@ Provider keys are added on the console's **Providers** page (or, for the origina
 | **Settings** | USD→INR rate, configured models and prices, system health |
 
 The console is static files served by the gateway with a strict Content-Security-Policy (no inline scripts, no
-external requests). The admin token is kept in the browser tab's session storage only.
+external requests). The admin token is kept in the browser tab's session storage only. It displays only what the API
+returns (totals, percentages and attention items are computed by the gateway), and asks for confirmation before any
+change that signs out, deletes, or changes what the gateway enforces. Light/dark theme and the collapsed sidebar are
+remembered per browser.
+
+Vendored files in `gateway/ui/` (committed; rebuilt only when a pinned version changes, with `scripts/vendor-ui.sh`):
+`fx.js` (React + metal-fx, the liquid-metal ring on primary buttons; loaded on first use, plain buttons if it can't
+run), the Geist fonts, and `fx.csp`, the hashes of the fixed `<style>` blocks metal-fx injects, which the gateway adds
+to the CSP so no other inline style is allowed. Licences: `gateway/ui/THIRD_PARTY.txt`.
 
 ---
 

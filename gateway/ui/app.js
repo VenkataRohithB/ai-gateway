@@ -1,6 +1,9 @@
 /* Agent Gateway admin console. Plain JS, no build step, no external requests.
    Security: every value from the API is inserted as text (never innerHTML); the admin token lives
-   in sessionStorage for this tab only. */
+   in sessionStorage for this tab only.
+   The console only displays what the API returns: totals, percentages, remaining amounts, attention items and
+   groupings all come from the gateway. Every action that signs out, deletes, discards, or changes what the
+   gateway enforces asks for confirmation first. */
 "use strict";
 
 // ------------------------------------------------------------------ DOM helpers
@@ -18,6 +21,7 @@ function h(tag, attrs, ...kids) {
   for (const [k, v] of Object.entries(attrs)) {
     if (v == null || v === false || k === "value" || k === "checked") continue;
     if (k === "class") el.className = [el.className, v].filter(Boolean).join(" ");
+    else if (k === "style") el.style.cssText = v; // CSSOM, allowed by the console's CSP (inline style attributes are not)
     else if (k.startsWith("on")) el.addEventListener(k.slice(2), v);
     else el.setAttribute(k, v === true ? "" : v);
   }
@@ -46,33 +50,30 @@ const ICONS = {
   overview: "M4 4h7v7H4zM13 4h7v7h-7zM4 13h7v7H4zM13 13h7v7h-7z",
   agents: "M12 3v3M7 7h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3v-7a3 3 0 0 1 3-3zM9.5 13.5h.01M14.5 13.5h.01",
   mandates: "M4 8h16v11H4zM9 8V5h6v3M4 13h16",
+  providers: "M14.5 9.5a3.5 3.5 0 1 1-1 2.5L4 21.5V18h3v-3h3l1-1M17 7h.01",
   usage: "M4 19h16M7 16V10M12 16V5M17 16v-4",
   policy: "M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z",
   activity: "M12 7v5l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
   settings: "M4 7h10M18 7h2M4 17h4M12 17h8M14 5v4M8 15v4",
-  plus: "M12 5v14M5 12h14",
-  up: "M12 19V5M6 11l6-6 6 6",
-  down: "M12 5v14M6 13l6 6 6-6",
-  x: "M6 6l12 12M18 6L6 18",
-  copy: "M9 9h10v10H9zM5 15V5h10",
+  plus: "M12 5v14M5 12h14", up: "M12 19V5M6 11l6-6 6 6", down: "M12 5v14M6 13l6 6 6-6", x: "M6 6l12 12M18 6L6 18",
+  copy: "M9 9h10v10H9zM5 15V5h10", check: "M5 12l5 5 9-10",
   key: "M14.5 9.5a3.5 3.5 0 1 1-1 2.5L4 21.5V18h3v-3h3l1-1M17 7h.01",
   info: "M12 8h.01M11 12h1v5h1M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
   alert: "M12 9v4M12 17h.01M10.3 3.9L2.4 18a2 2 0 0 0 1.7 3h15.8a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z",
-  arrow: "M5 12h14M13 6l6 6-6 6",
-  logout: "M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10",
-  gate: "M4 21V9l8-5 8 5v12M9 21v-6h6v6",
-  lock: "M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z",
-  empty: "M4 13h4l2 3h4l2-3h4M4 13l3-8h10l3 8v6H4z",
-  check: "M5 12l5 5 9-10",
-  providers: "M14.5 9.5a3.5 3.5 0 1 1-1 2.5L4 21.5V18h3v-3h3l1-1M17 7h.01",
+  arrow: "M5 12h14M13 6l6 6-6 6", chev: "M9 6l6 6-6 6",
+  logout: "M15 4h4v16h-4M10 8l-4 4 4 4M6 12h10", gate: "M4 21V9l8-5 8 5v12M9 21v-6h6v6",
+  lock: "M7 11V8a5 5 0 0 1 10 0v3M5 11h14v10H5z", grip: "M9 6h.01M15 6h.01M9 12h.01M15 12h.01M9 18h.01M15 18h.01",
+  sun: "M12 4V2M12 22v-2M4 12H2M22 12h-2M5.6 5.6 4.2 4.2M19.8 19.8l-1.4-1.4M5.6 18.4l-1.4 1.4M19.8 4.2l-1.4 1.4M12 17a5 5 0 1 0 0-10 5 5 0 0 0 0 10z",
+  moon: "M20 14.5A8 8 0 0 1 9.5 4a8 8 0 1 0 10.5 10.5z",
+  collapse: "M4 4h16v16H4zM9 4v16M15 10l-2 2 2 2", expand: "M4 4h16v16H4zM9 4v16M13 10l2 2-2 2",
 };
 
 function icon(name) {
-  return svg("svg", { viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": "1.8",
+  return svg("svg", { class: "i", viewBox: "0 0 24 24", fill: "none", stroke: "currentColor", "stroke-width": name === "grip" ? "2.6" : "1.7",
     "stroke-linecap": "round", "stroke-linejoin": "round", "aria-hidden": "true" }, svg("path", { d: ICONS[name] }));
 }
 
-// ------------------------------------------------------------------ formatting
+// ------------------------------------------------------------------ formatting (display only)
 const CURRENCY = { USD: { sym: "$", locale: "en-US" }, INR: { sym: "₹", locale: "en-IN" } };
 
 function money(value, currency = "USD") {
@@ -84,7 +85,8 @@ function money(value, currency = "USD") {
 }
 const int = (n) => Number(n || 0).toLocaleString("en-US");
 const dateTime = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", hour: "2-digit", minute: "2-digit" });
-const dateOnly = new Intl.DateTimeFormat(undefined, { day: "numeric", month: "short", year: "numeric" });
+const timeOnly = new Intl.DateTimeFormat(undefined, { hour: "2-digit", minute: "2-digit" });
+const dayLong = new Intl.DateTimeFormat(undefined, { weekday: "long", day: "numeric", month: "long" });
 const when = (iso) => (iso ? dateTime.format(new Date(iso)) : "—");
 function ago(iso) {
   if (!iso) return "Never";
@@ -98,16 +100,10 @@ function monthName(ym) {
   const [y, m] = ym.split("-").map(Number);
   return new Date(y, m - 1, 1).toLocaleString(undefined, { month: "long", year: "numeric" });
 }
-function nextReset(ym) {
-  const [y, m] = ym.split("-").map(Number);
-  return new Date(y, m, 1).toLocaleString(undefined, { day: "numeric", month: "long" });
-}
-function currentMonth() {
-  // budget months follow India time
-  const parts = new Intl.DateTimeFormat("en-CA", { timeZone: "Asia/Kolkata", year: "numeric", month: "2-digit" }).formatToParts(new Date());
-  return `${parts.find((p) => p.type === "year").value}-${parts.find((p) => p.type === "month").value}`;
-}
+const dayMonth = (isoDate) => new Date(`${isoDate}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "long" });
 const slugify = (s) => s.toLowerCase().trim().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 64);
+const plural = (n, word) => `${int(n)} ${word}${Number(n) === 1 ? "" : "s"}`;
+const titleCase = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 
 const REASONS = {
   AGENT_REVOKED: "Agent revoked", AGENT_INACTIVE: "Agent suspended", MANDATE_NOT_ASSIGNED: "Not assigned to mandate",
@@ -119,6 +115,15 @@ const REASONS = {
   STREAMING_NOT_SUPPORTED: "Streaming not supported", REQUEST_TOO_LARGE: "Request too large", ABANDONED: "Abandoned, charged",
 };
 const reasonText = (code) => REASONS[code] || code;
+
+// ------------------------------------------------------------------ per-viewer preferences (theme, sidebar)
+const pref = {
+  get(k) { try { return localStorage.getItem(k); } catch { return null; } },
+  set(k, v) { try { localStorage.setItem(k, v); } catch { /* storage blocked: the choice lasts this page only */ } },
+};
+if (pref.get("gw_theme")) document.documentElement.dataset.theme = pref.get("gw_theme");
+const themeNow = () => document.documentElement.dataset.theme || (matchMedia("(prefers-color-scheme: dark)").matches ? "dark" : "light");
+const stillMotion = () => matchMedia("(prefers-reduced-motion: reduce)").matches;
 
 // ------------------------------------------------------------------ API
 const TOKEN_KEY = "gw_admin_token";
@@ -155,33 +160,60 @@ async function api(method, path, body) {
   return data;
 }
 
+// ------------------------------------------------------------------ liquid-metal ring on primary buttons
+// fx.js is the vendored metal-fx effect (scripts/vendor-ui.sh). It loads once, on first use; if it can't load or the
+// browser has no WebGL2, the plain button stays.
+let fxLoad = null;
+function gloss(scope) {
+  if (!scope) return;
+  for (const b of scope.querySelectorAll(".btn.primary")) {
+    if (b.parentElement?.closest(".fx")) continue;
+    const host = h("span", { class: `fx${b.classList.contains("block") ? " block" : ""}` });
+    b.replaceWith(host);
+    host.append(b);
+    (fxLoad ||= import("/admin/ui/fx.js").catch(() => null)).then((fx) => {
+      if (fx) requestAnimationFrame(() => { try { fx.metal(host, b, themeNow(), stillMotion()); } catch { /* plain button stays */ } });
+    });
+  }
+}
+
 // ------------------------------------------------------------------ feedback: toasts, modals, confirm
 function toast(message, kind = "") {
   let host = document.querySelector(".toasts");
   if (!host) document.body.append(host = h("div.toasts", { role: "status", "aria-live": "polite" }));
-  const t = h("div", { class: `toast ${kind}` }, message);
+  const t = h("div", { class: `toast ${kind}` }, icon(kind === "error" ? "alert" : "check"), h("span", message));
   host.append(t);
-  setTimeout(() => t.remove(), kind === "error" ? 6000 : 3200);
+  setTimeout(() => {
+    t.classList.add("out");
+    t.addEventListener("animationend", () => t.remove());
+    setTimeout(() => t.remove(), 400); // reduced motion: no animationend
+  }, kind === "error" ? 6000 : 3200);
 }
 
 function modal({ title, sub, wide }) {
   const previous = document.activeElement;
   const body = h("div.modal-body");
   const foot = h("div.modal-foot");
-  const box = h("div", { class: `modal${wide ? " wide" : ""}`, role: "dialog", "aria-modal": "true", "aria-label": title },
+  const box = h("div", { class: `modal${wide ? " wide" : ""}`, role: "dialog", "aria-modal": "true", "aria-label": title, tabindex: "-1" },
     h("div.modal-head", h("h2", title), sub && h("p", sub)), body, foot);
   const overlay = h("div.overlay", box);
   const onKey = (e) => { if (e.key === "Escape") close(); };
   function close() {
-    overlay.remove();
     document.removeEventListener("keydown", onKey);
+    overlay.classList.add("out");
+    const gone = () => overlay.remove();
+    overlay.addEventListener("animationend", gone);
+    setTimeout(gone, 300);
     previous?.focus?.();
   }
   overlay.addEventListener("mousedown", (e) => { if (e.target === overlay) close(); });
   document.addEventListener("keydown", onKey);
   document.body.append(overlay);
-  requestAnimationFrame(() => (box.querySelector("input:not([type=checkbox]), select, textarea") || box.querySelector(".btn.primary") || box).focus());
-  box.tabIndex = -1;
+  // focus the first field, or Cancel (the safe choice) when there is none
+  requestAnimationFrame(() => {
+    gloss(foot);
+    (box.querySelector("input:not([type=checkbox]), select, textarea") || foot.querySelector(".btn") || box).focus();
+  });
   return { body, foot, close };
 }
 
@@ -190,7 +222,7 @@ function confirmDialog({ title, message, confirm = "Confirm", danger = false }) 
     const m = modal({ title });
     let answered = false;
     const done = (v) => { if (!answered) { answered = true; m.close(); resolve(v); } };
-    append(m.body, h("p.m0", message));
+    append(m.body, h("p", message));
     append(m.foot,
       h("button.btn", { type: "button", onclick: () => done(false) }, "Cancel"),
       h("button", { type: "button", class: `btn ${danger ? "danger solid" : "primary"}`, onclick: () => done(true) }, confirm));
@@ -198,28 +230,36 @@ function confirmDialog({ title, message, confirm = "Confirm", danger = false }) 
     obs.observe(document.body, { childList: true });
   });
 }
+/* Every action that signs out, deletes, discards, or changes what the gateway enforces asks first. */
+const ask = (title, message, confirm, danger = false) => confirmDialog({ title, message, confirm, danger });
 
 function formError() {
-  const el = h("div.form-error.hidden", { role: "alert" });
-  el.show = (msg) => { el.textContent = msg; el.classList.remove("hidden"); };
-  el.clear = () => el.classList.add("hidden");
+  const el = h("div.err", { role: "alert", hidden: true });
+  el.show = (msg) => { el.textContent = msg; el.hidden = false; el.style.animation = "none"; void el.offsetWidth; el.style.animation = ""; };
+  el.clear = () => { el.hidden = true; };
   return el;
 }
 
 async function busy(button, fn) {
-  const label = button.textContent;
   button.disabled = true;
-  try { return await fn(); } finally { button.disabled = false; button.textContent = label; }
+  try { return await fn(); } finally { button.disabled = false; }
 }
 
-async function copyText(text) {
+async function copyText(text, button) {
   try {
     await navigator.clipboard.writeText(text);
-    toast("Copied to clipboard");
+    if (button) { button.classList.add("copied"); setTimeout(() => button.classList.remove("copied"), 1600); } else toast("Copied to clipboard");
   } catch {
     toast("Couldn't copy automatically. Select the text and copy it.", "error");
   }
 }
+function copyButton(text, label = "Copy") {
+  const b = h("button.btn.sm", { type: "button", "aria-label": `${label}: ${text}` },
+    h("span.default", icon("copy"), label), h("span.done", icon("check"), "Copied"));
+  b.addEventListener("click", () => copyText(text, b));
+  return b;
+}
+const copyRow = (text) => h("div.copy", h("span.code", { title: text }, text), copyButton(text));
 
 // ------------------------------------------------------------------ form controls
 function field(label, control, help) {
@@ -231,98 +271,143 @@ function select(options, value, attrs = {}) {
   return h("select.select", { ...attrs, value }, options.map(([v, label]) => h("option", { value: v }, label)));
 }
 function toggle(label, checked, onchange) {
-  const box = h("input", { type: "checkbox", role: "switch", checked, onchange: onchange && ((e) => onchange(e.target.checked)) });
+  const box = h("input", { type: "checkbox", role: "switch", checked, onchange: onchange && ((e) => onchange(e.target.checked, e)) });
   const el = h("label.switch", box, h("span", label));
   el.input = box;
   return el;
 }
 
-/** Segmented control. options: [[value, label, toneClass?]]. el.value is the current value. */
+/** Segmented control with a sliding thumb. options: [[value, label, tone?]]. onchange may return false to refuse. */
 function segmented(options, value, onchange, label) {
   const el = h("div.seg", { role: "group", "aria-label": label || "" });
+  const thumb = h("div.seg-thumb");
   el.value = value;
+  const sync = () => {
+    buttons.forEach((b, i) => b.setAttribute("aria-pressed", String(options[i][0] === el.value)));
+    const b = buttons[options.findIndex((o) => o[0] === el.value)];
+    if (b) { thumb.style.width = `${b.offsetWidth}px`; thumb.style.transform = `translateX(${b.offsetLeft}px)`; }
+  };
   const buttons = options.map(([v, text, tone]) => h("button", {
     type: "button", class: tone || "", "aria-pressed": String(v === value),
-    onclick: () => {
+    onclick: async () => {
       if (el.value === v) return;
+      if ((await onchange?.(v)) === false) return;
       el.value = v;
-      buttons.forEach((b, i) => b.setAttribute("aria-pressed", String(options[i][0] === v)));
-      onchange?.(v);
+      sync();
     },
-  }, text));
-  append(el, buttons);
+  }, tone && h("span.d"), text));
+  append(el, thumb, buttons);
+  requestAnimationFrame(() => { thumb.style.transition = "none"; sync(); requestAnimationFrame(() => { thumb.style.transition = ""; }); });
+  return el;
+}
+
+/** Tabs with a sliding underline. items: [[value, label]] */
+function tabs(items, value, onchange) {
+  const bar = h("div.bar");
+  const el = h("div.tabs", { role: "tablist" });
+  const buttons = items.map(([v, label]) => h("button", { type: "button", role: "tab", "aria-selected": String(v === value), onclick: () => onchange(v) }, label));
+  append(el, buttons, bar);
+  requestAnimationFrame(() => {
+    const b = buttons[items.findIndex(([v]) => v === value)];
+    if (b) { bar.style.width = `${b.offsetWidth}px`; bar.style.transform = `translateX(${b.offsetLeft}px)`; }
+  });
   return el;
 }
 
 /** Amount + currency picker. Returns { el, get(), amount } */
 function budgetInput(amount, currency) {
-  const addon = h("span.addon", CURRENCY[currency].sym);
+  const addon = h("span", CURRENCY[currency].sym);
   const amountInput = input({ type: "number", min: "0", step: "0.01", inputmode: "decimal", value: amount, "aria-label": "Monthly budget amount" });
   const seg = segmented([["USD", "USD"], ["INR", "INR"]], currency, (c) => { addon.textContent = CURRENCY[c].sym; }, "Budget currency");
-  const el = h("div.input-group", addon, amountInput, seg);
+  const el = h("div.group", h("div.affix", addon, amountInput), seg);
   return { el, amount: amountInput, get: () => ({ budget: amountInput.value.trim() || "0", budget_currency: seg.value }) };
 }
 
 // ------------------------------------------------------------------ display components
 const STATUS_TONE = { active: "ok", suspended: "warn", revoked: "danger" };
-const titleCase = (s) => s.charAt(0).toUpperCase() + s.slice(1);
 const statusPill = (status) => h("span", { class: `pill ${STATUS_TONE[status] || ""}` }, titleCase(status));
 const OUTCOME = { ok: ["Answered", "ok"], denied: ["Blocked", "danger"], error: ["Failed", "warn"], timeout: ["Timed out", "warn"] };
-// Tier tag: a pill (scannable in tables) plus where the verdict came from, so nobody mistakes a guess for a fact.
+// Tier tag: a pill plus where the verdict came from, so nobody mistakes a guess for a fact.
 const TIER = { free: ["Free tier", "info"], paid: ["Paid", "ok"], unknown: ["Not detected yet", ""] };
 const tierPill = (t) => h("span", { class: `pill plain ${TIER[t]?.[1] || ""}` }, TIER[t]?.[0] || t);
 const outcomePill = (o) => h("span", { class: `pill ${OUTCOME[o]?.[1] || ""}` }, OUTCOME[o]?.[0] || o);
 
+/** Budget meter from the API's percentages: solid = charged, hatched = held for calls in flight. */
 function meter(v, large = false) {
   const level = v.used_pct >= 100 ? "danger" : v.used_pct >= 80 ? "warn" : "";
-  const fill = h("div.meter-fill");
+  const fill = h("div.fill");
   fill.style.width = `${Math.min(100, v.spent_pct)}%`;
-  const hold = h("div.meter-hold", { title: Number(v.reserved) > 0 ? `${money(v.reserved, v.budget_currency)} held for calls in progress` : null });
+  const hold = h("div.held", { title: Number(v.reserved) > 0 ? `${money(v.reserved, v.budget_currency)} held for calls in progress` : null });
   hold.style.width = `${Math.max(0, Math.min(100 - Math.min(100, v.spent_pct), v.held_pct))}%`;
   return h("div", { class: `meter ${level}${large ? " lg" : ""}` },
-    h("div.meter-track", { role: "img", "aria-label": `${Math.round(v.used_pct)}% of budget used` }, fill, hold),
-    h("div.meter-label",
-      h("span", h("strong", money(v.spent, v.budget_currency)), ` of ${money(v.budget, v.budget_currency)}`),
+    h("div.track", { role: "img", "aria-label": `${Math.round(v.used_pct)}% of budget used` }, fill, hold),
+    h("div.lab",
+      h("span", h("b", money(v.spent, v.budget_currency)), ` of ${money(v.budget, v.budget_currency)}`),
       h("span", Number(v.budget) > 0 ? `${Math.round(v.used_pct)}%` : "No budget")));
 }
 
-function chips(items, { lead = false, arrows = false, text = false } = {}) {
+function chips(items, { lead = false, arrows = false, text = null, href = null } = {}) {
   if (!items.length) return h("span.faint", "None");
   const out = [];
   items.forEach((t, i) => {
-    if (i && arrows) out.push(h("span.chip-sep", { "aria-hidden": "true" }, "→"));
-    out.push(h("span", { class: `chip${lead && i === 0 ? " lead" : ""}${text ? " text" : ""}` }, t));
+    if (i && arrows) out.push(h("span.sep", { "aria-hidden": "true" }, "→"));
+    out.push(h(href ? "a" : "span", { class: `chip${lead && i === 0 ? " lead" : ""}${text ? " text" : ""}`, href: href?.(t) }, text ? text(t) : t));
   });
   return h("div.chips", out);
 }
 
-function card({ title, hint, actions, body, flush = false, foot }) {
-  return h("section.card",
+function card({ title, hint, actions, body, flush = false, foot, cls }) {
+  return h("section", { class: `card${cls ? ` ${cls}` : ""}` },
     (title || actions) && h("div.card-head", h("div", title && h("h2", title), hint && h("div.hint", hint)), actions && h("div.actions", actions)),
     body !== undefined && h("div", { class: `card-body${flush ? " flush" : ""}` }, body),
-    foot);
+    foot && h("div.card-foot", foot));
 }
 
 function emptyState(title, text, action) {
-  return h("div.empty", icon("empty"), h("strong", title), text && h("div", text), action);
+  return h("div.empty", h("strong", title), text && h("div", text), action);
 }
 
-function pageHead({ crumbs, title, badge, sub, actions }) {
-  return h("header.page-head",
-    h("div", crumbs && h("div.crumbs", crumbs), h("h1", title, badge), sub && h("div.sub", sub)),
+function pageHead({ back, title, badge, sub, actions }) {
+  return h("header.head",
+    h("div", back && h("a.back", { href: `#/${back}` }, "← ", titleCase(back)), h("h1", title, badge), sub && h("div.sub", sub)),
     actions && h("div.actions", actions));
 }
 
-/** cols: [{ label, render(row), align: "r", width }] */
+/** cols: [{ label, render(row), align: "r", title }] */
 function table(cols, rows, { onRow, empty, foot } = {}) {
   if (!rows.length) return empty || emptyState("Nothing here yet");
-  return h("div.table-wrap", h("table",
-    h("thead", h("tr", cols.map((c) => h("th", { class: c.align || null, scope: "col" }, c.label)))),
+  return h("div.tw", h("table",
+    h("thead", h("tr", cols.map((c) => h("th", { class: c.align || null, scope: "col", title: c.title }, c.label)))),
     h("tbody", rows.map((r) => h("tr", {
-      class: onRow ? "clickable" : null,
+      class: onRow ? "click" : null,
       onclick: onRow ? (e) => { if (!e.target.closest("a, button, input, select")) onRow(r); } : null,
     }, cols.map((c) => h("td", { class: c.align || null }, c.render(r)))))),
     foot && h("tfoot", h("tr", foot.map((f, i) => h("td", { class: cols[i]?.align || null }, f))))));
+}
+const goCell = { label: "", align: "r", render: () => h("span.go", icon("chev")) };
+
+function callout(kind, ...content) {
+  return h("div", { class: `callout ${kind || ""}` }, icon(kind === "warn" || kind === "danger" ? "alert" : "info"), h("div", content));
+}
+
+function errorCard(e, retry) {
+  return card({ body: [callout("danger", h("b", "Couldn't load this page. "), e.message),
+    retry && h("div", h("button.btn", { type: "button", onclick: retry }, "Try again"))] });
+}
+
+/** Animate a number from 0 to its API value. Whole numbers count in whole steps. */
+function countUp(value, format, whole = false) {
+  const el = h("span", format(value));
+  const to = Number(value || 0);
+  if (stillMotion() || !to) return el;
+  const t0 = performance.now(), duration = 900;
+  const step = (t) => {
+    const p = Math.min(1, (t - t0) / duration), v = to * (1 - Math.pow(1 - p, 4));
+    el.textContent = p < 1 ? format(whole ? Math.round(v) : v) : format(value);
+    if (p < 1) requestAnimationFrame(step);
+  };
+  requestAnimationFrame(step);
+  return el;
 }
 
 function niceMax(v) {
@@ -332,53 +417,65 @@ function niceMax(v) {
   return (f <= 1 ? 1 : f <= 2 ? 2 : f <= 5 ? 5 : 10) * e;
 }
 
-/** Bar chart of daily values. points: [{ day: "YYYY-MM-DD", value, title }] */
-function barChart(points, label) {
-  const W = 720, H = 190, L = 64, R = 8, T = 10, B = 26;
-  const top = niceMax(Math.max(0, ...points.map((p) => p.value)));
-  const plotH = H - T - B, step = (W - L - R) / Math.max(1, points.length);
+/** Sparkline of daily spend (the API's daily values, scaled to the box). */
+function spark(values) {
+  const W = 200, H = 30, max = Math.max(...values) || 1, step = W / Math.max(1, values.length - 1);
+  const pts = values.map((v, i) => [i * step, H - (v / max) * (H - 3) - 1.5]);
+  const d = pts.map((p, i) => `${i ? "L" : "M"}${p[0].toFixed(1)},${p[1].toFixed(1)}`).join("");
+  const last = pts[pts.length - 1];
+  return svg("svg", { class: "spark", viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: "none", "aria-hidden": "true" },
+    svg("path", { d: `${d}L${W},${H}L0,${H}Z`, fill: "var(--accent-soft)" }),
+    svg("path", { d, fill: "none", stroke: "var(--accent)", "stroke-width": "1.5", "vector-effect": "non-scaling-stroke" }),
+    svg("circle", { cx: last[0], cy: last[1], r: 2.5, fill: "var(--accent)" }));
+}
+
+/** Bar chart of the API's daily rows, with a tooltip per day. */
+function barChart(days, label) {
+  const W = 720, H = 200, L = 48, R = 4, T = 10, B = 26;
+  const values = days.map((d) => Number(d.cost_usd));
+  const top = niceMax(Math.max(0, ...values));
+  const plotH = H - T - B, step = (W - L - R) / Math.max(1, days.length);
   const el = svg("svg", { viewBox: `0 0 ${W} ${H}`, class: "chart", role: "img", "aria-label": label });
-  for (let i = 0; i <= (top ? 2 : 0); i++) {
-    const y = T + plotH - (plotH * i) / 2;
+  const tip = h("div.tip");
+  for (const f of top ? [0, 0.5, 1] : [0]) {
+    const y = T + plotH - plotH * f;
     el.append(svg("line", { x1: L, x2: W - R, y1: y, y2: y, class: "grid" }),
-      svg("text", { x: L - 8, y: y + 4, "text-anchor": "end", class: "axis" }, money((top * i) / 2)));
+      svg("text", { x: L - 8, y: y + 4, "text-anchor": "end", class: "axis" }, money(top * f).replace(/\.00$/, "")));
   }
-  points.forEach((p, i) => {
-    const hgt = top ? (p.value / top) * plotH : 0;
-    const bar = svg("rect", { x: L + i * step + step * 0.16, width: step * 0.68, y: T + plotH - Math.max(hgt, 1.5),
-      height: Math.max(hgt, 1.5), rx: 2, class: p.value > 0 ? "bar" : "bar zero" }, svg("title", {}, p.title));
-    el.append(bar);
-    if ((i % 7 === 0 && points.length - 1 - i >= 4) || i === points.length - 1) {
-      const d = new Date(`${p.day}T00:00:00`);
-      el.append(svg("text", { x: L + i * step + step / 2, y: H - 8, "text-anchor": "middle", class: "axis" },
-        d.toLocaleDateString(undefined, { day: "numeric", month: "short" })));
+  days.forEach((d, i) => {
+    const hgt = top ? Math.max((values[i] / top) * plotH, 2) : 2, x = L + i * step + step * 0.18, w = step * 0.64, y = T + plotH - hgt;
+    const r = Math.min(3, w / 2, hgt);
+    const bar = svg("path", { class: values[i] > 0 ? "bar" : "bar zero",
+      d: `M${x},${T + plotH}V${y + r}q0,-${r} ${r},-${r}h${w - 2 * r}q${r},0 ${r},${r}V${T + plotH}Z` });
+    bar.style.animationDelay = `${i * 18}ms`;
+    const hit = svg("rect", { class: "hit", x: L + i * step, y: T, width: step, height: plotH });
+    hit.addEventListener("mouseenter", () => {
+      el.classList.add("dim");
+      el.querySelectorAll(".bar.on").forEach((b) => b.classList.remove("on"));
+      bar.classList.add("on");
+      const scale = el.getBoundingClientRect().width / W;
+      tip.replaceChildren(h("b", money(d.cost_usd)),
+        h("span", `${new Date(`${d.day}T00:00:00`).toLocaleDateString(undefined, { weekday: "short", day: "numeric", month: "short" })} · ${int(d.requests)} calls · ${int(d.denied)} blocked`));
+      tip.style.left = `${(x + w / 2) * scale}px`;
+      tip.style.top = `${y * scale}px`;
+      tip.classList.add("on");
+    });
+    el.append(bar, hit);
+    if (i % 7 === 2 || i === days.length - 1) {
+      el.append(svg("text", { x: L + i * step + step / 2, y: H - 6, "text-anchor": "middle", class: "axis" },
+        i === days.length - 1 ? "Today" : new Date(`${d.day}T00:00:00`).toLocaleDateString(undefined, { day: "numeric", month: "short" })));
     }
   });
-  return el;
+  el.addEventListener("mouseleave", () => { el.classList.remove("dim"); tip.classList.remove("on"); });
+  return h("div.chart-wrap", el, tip);
 }
 
-function dailyChartCard(daily, title = "Daily spend", hint = "Last 30 days, India time") {
+function dailyChartCard(daily, title = "Daily spend") {
   const t = daily.totals;
-  const points = daily.days.map((d) => ({ day: d.day, value: Number(d.cost_usd),
-    title: `${dateOnly.format(new Date(`${d.day}T00:00:00`))}: ${money(d.cost_usd)} · ${d.requests} calls · ${d.denied} blocked` }));
-  return card({ title, hint, body: [
-    barChart(points, `${title}: ${money(t.cost_usd)} over ${daily.days.length} days`),
-    h("div.chart-legend", h("span", `${money(t.cost_usd)} spent · ${int(t.requests)} sent to a model · ${int(t.denied)} blocked`), h("span", "Hover a bar for the day")),
+  return card({ title, hint: `Last ${daily.days.length} days, India time`, body: [
+    barChart(daily.days, `${title}: ${money(t.cost_usd)} over ${daily.days.length} days`),
+    h("div.legend", h("span", `${money(t.cost_usd)} spent · ${int(t.requests)} sent to a model · ${int(t.denied)} blocked`), h("span", "Hover a day for detail")),
   ] });
-}
-
-function copyRow(text, label) {
-  return h("div.copy-row", h("span.code", { title: text }, text),
-    h("button.btn.sm", { type: "button", "aria-label": `Copy ${label || text}`, onclick: () => copyText(text) }, icon("copy"), "Copy"));
-}
-
-function callout(kind, ...content) {
-  return h("div", { class: `callout ${kind || ""}` }, icon(kind === "warn" || kind === "danger" ? "alert" : "info"), h("div", content));
-}
-
-function errorCard(e, retry) {
-  return card({ body: h("div.page-error", callout("danger", h("strong", "Couldn't load this page. "), e.message),
-    retry && h("div", h("button.btn", { type: "button", onclick: retry }, "Try again"))) });
 }
 
 // ------------------------------------------------------------------ shell, routing, sign-in
@@ -389,21 +486,77 @@ const NAV = [
 const root = () => document.getElementById("app");
 let renderSeq = 0;
 
+function themeButton() {
+  const b = h("button.btn.ghost.sm.icon", { type: "button" });
+  const paint = () => {
+    const dark = themeNow() === "dark";
+    b.replaceChildren(icon(dark ? "sun" : "moon"));
+    b.setAttribute("aria-label", dark ? "Switch to light" : "Switch to dark");
+    b.title = b.getAttribute("aria-label");
+  };
+  b.addEventListener("click", () => {
+    const next = themeNow() === "dark" ? "light" : "dark";
+    document.documentElement.dataset.theme = next;
+    pref.set("gw_theme", next);
+    paint();
+    refresh(); // the metal ring takes the theme when it mounts
+  });
+  paint();
+  return b;
+}
+
+/** Sidebar status: /health/ready, every 15 seconds while the console is open. */
+function healthLink() {
+  const dot = h("span.dot"), text = h("span.txt", "Checking…");
+  const el = h("a.health", { href: "#/settings" }, dot, text);
+  const check = async () => {
+    if (!el.isConnected && el.dataset.started) return;
+    el.dataset.started = "1";
+    const r = await fetch("/health/ready", { cache: "no-store" }).then((x) => x.json()).catch(() => ({}));
+    const down = [["db", "Database"], ["litellm", "LiteLLM"], ["prices", "Prices"]].filter(([k]) => !r[k]).map(([, label]) => label);
+    dot.className = `dot ${down.length ? "danger" : "live"}`;
+    text.textContent = down.length ? `${down.join(", ")} not ready` : "All systems normal";
+    el.title = down.length ? `${down.join(", ")} not ready` : "Database, LiteLLM and prices are ready";
+    setTimeout(check, 15000);
+  };
+  check();
+  return el;
+}
+
+function moveIndicator() {
+  const a = document.querySelector('.nav a[aria-current="page"]'), ind = document.querySelector(".nav-ind");
+  if (!ind) return;
+  ind.style.opacity = a ? "1" : "0";
+  if (a) ind.style.transform = `translateY(${a.offsetTop}px)`;
+}
+
 function shell() {
-  const nav = h("nav.nav", { "aria-label": "Main" },
-    h("div.nav-label", "Manage"),
-    NAV.slice(0, 4).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)),
-    h("div.nav-label", "Monitor"),
-    NAV.slice(4, 6).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)),
-    h("div.nav-label", "System"),
-    NAV.slice(6).map(([id, label]) => h("a", { href: `#/${id}`, "data-nav": id }, icon(id), label)));
-  return h("div.shell",
+  const link = ([id, label]) => h("a", { href: `#/${id}`, "data-nav": id, title: label }, icon(id), h("span.lbl", label));
+  let mini = pref.get("gw_side_mini") === "1";
+  const collapse = h("button.btn.ghost.sm.icon", { type: "button" });
+  const paint = () => {
+    el.classList.toggle("mini", mini);
+    const label = mini ? "Expand sidebar" : "Collapse sidebar";
+    collapse.setAttribute("aria-label", label);
+    collapse.title = label;
+    collapse.replaceChildren(icon(mini ? "expand" : "collapse"));
+  };
+  collapse.addEventListener("click", () => { mini = !mini; pref.set("gw_side_mini", mini ? "1" : "0"); paint(); setTimeout(moveIndicator, 320); });
+  const el = h("div.shell",
     h("aside.side",
-      h("div.brand", h("div.brand-mark", icon("gate")), h("div", h("div.brand-name", "Agent Gateway"), h("div.brand-sub", "Admin console"))),
-      nav,
-      h("div.side-foot", h("span", "Signed in with the admin token"),
-        h("button.btn.ghost.sm", { type: "button", onclick: () => signOut() }, icon("logout"), "Sign out"))),
-    h("main.main", { id: "main" }, h("div.page", { id: "page" })));
+      h("div.side-top", collapse),
+      h("nav.nav", { "aria-label": "Main" }, h("div.nav-ind"),
+        h("div.nav-label", "Manage"), NAV.slice(0, 4).map(link),
+        h("div.nav-label", "Monitor"), NAV.slice(4, 6).map(link),
+        h("div.nav-label", "System"), NAV.slice(6).map(link)),
+      h("div.side-foot",
+        healthLink(),
+        h("div.who", h("div.mark", icon("gate")), h("b", "Agent Gateway"),
+          h("div.side-actions", themeButton(),
+            h("button.btn.ghost.sm.icon", { type: "button", onclick: confirmSignOut, "aria-label": "Sign out", title: "Sign out" }, icon("logout")))))),
+    h("main.main", { id: "main" }, h("div.sheet", h("div.page", { id: "page" }))));
+  paint();
+  return el;
 }
 
 function signOut(message) {
@@ -411,12 +564,15 @@ function signOut(message) {
   location.hash = "";
   renderLogin(message);
 }
+async function confirmSignOut() {
+  if (await ask("Sign out?", "You'll need the admin token to sign in again.", "Sign out")) signOut();
+}
 
 function renderLogin(message) {
   const token = input({ type: "password", autocomplete: "current-password", placeholder: "adm_…", class: "mono" });
   const err = formError();
   if (message) err.show(message);
-  const submit = h("button.btn.primary", { type: "submit" }, "Sign in");
+  const submit = h("button.btn.primary.block", { type: "submit" }, "Sign in");
   const form = h("form.form", { onsubmit: async (e) => {
     e.preventDefault();
     err.clear();
@@ -430,11 +586,14 @@ function renderLogin(message) {
       if (!location.hash) location.hash = "#/overview";
       render();
     });
-  } }, err, field("Admin token", token, "It's ADMIN_TOKEN in the gateway's .env file."), submit);
+  } }, err, field("Admin token", token, "It's ADMIN_TOKEN in the gateway's .env file. Kept for this tab only."), submit);
   root().className = "";
-  root().replaceChildren(h("div.login", h("section.card", h("div.card-body",
-    h("div.brand", h("div.brand-mark", icon("gate")), h("div", h("h1", "Agent Gateway"), h("div.brand-sub", "Admin console"))),
-    form))));
+  root().replaceChildren(h("div.login", h("div.login-card.enter",
+    h("div.brand", h("div.mark", icon("gate")), h("b", "Agent Gateway")),
+    h("h1", "Sign in"),
+    h("section.card", form))));
+  gloss(root());
+  token.focus();
 }
 
 const ROUTES = [
@@ -467,15 +626,18 @@ async function render(quiet = false) {
   const section = path.split("/")[1];
   document.querySelectorAll("[data-nav]").forEach((a) =>
     a.dataset.nav === section ? a.setAttribute("aria-current", "page") : a.removeAttribute("aria-current"));
+  moveIndicator();
   const page = document.getElementById("page");
   const route = ROUTES.find(([re]) => re.test(path));
   const seq = ++renderSeq;
-  if (!quiet) page.replaceChildren(h("div.skeleton"), h("div.skeleton"));
+  if (!quiet) { page.className = "page"; page.replaceChildren(h("div.skeleton"), h("div.skeleton")); }
   try {
     if (!route) throw new ApiError(404, "NOT_FOUND", "This page doesn't exist.");
     const view = await route[1](path.match(route[0]), query);
     if (seq !== renderSeq) return;
+    page.className = quiet ? "page" : "page enter";
     page.replaceChildren(...[view].flat().filter(Boolean));
+    gloss(page.querySelector(".head"));
     document.title = `${(NAV.find(([id]) => id === section) || [, "Admin"])[1]} · Agent Gateway`;
     if (!quiet) window.scrollTo(0, 0);
   } catch (e) {
@@ -484,67 +646,108 @@ async function render(quiet = false) {
   }
 }
 const refresh = () => render(true);
-const go = (hash) => { location.hash = hash; };
+const go = (hash) => { if (location.hash === hash) render(); else location.hash = hash; };
 
 // ------------------------------------------------------------------ overview
-function kpi(label, value, foot) {
-  return h("section.card.kpi", h("div.label", label), h("div.value", value), foot && h("div.foot", foot));
+function kpi(label, value, foot, extra) {
+  return h("div.kpi", h("div.k", label), h("div.v", value), foot && h("div.f", foot), extra);
+}
+
+/** The gate: blocked calls per step today (API), then answered. Dots are ambient: they run the lane and drop
+    out only at steps that blocked something today; their rate is not data. */
+function gateCard(today) {
+  const steps = today.blocked_by_step;
+  const canvas = h("canvas", { "aria-hidden": "true" });
+  const grid = h("div.stages",
+    steps.map((st, i) => h("a.stage", { href: st.step === "policy" ? "#/policy" : "#/usage?outcome=denied" },
+      h("span.n", String(i + 1).padStart(2, "0")), h("span.t", st.label),
+      h("span", { class: `out${st.count ? " block" : ""}` }, st.count ? `${int(st.count)} blocked` : "none blocked"))),
+    h("a.stage.end", { href: "#/usage?outcome=ok" }, h("span.n", "✓"), h("span.t", "Answered"), h("span.out.pass", plural(today.ok, "call")),
+      today.failed ? h("span.out", `${int(today.failed)} failed at provider`) : null));
+  requestAnimationFrame(() => {
+    if (stillMotion()) return;
+    const ctx = canvas.getContext("2d"), dots = [];
+    let last = 0;
+    const loop = (t) => {
+      if (!canvas.isConnected) return;
+      const r = canvas.getBoundingClientRect(), dpr = devicePixelRatio || 1;
+      if (canvas.width !== Math.round(r.width * dpr)) { canvas.width = r.width * dpr; canvas.height = r.height * dpr; }
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, r.width, r.height);
+      const cards = [...grid.children].map((c) => c.getBoundingClientRect());
+      if (cards[0].top !== cards[cards.length - 1].top) { requestAnimationFrame(loop); return; } // wrapped layout: no lane
+      const css = getComputedStyle(document.documentElement);
+      const accent = css.getPropertyValue("--accent").trim(), danger = css.getPropertyValue("--danger").trim();
+      const y = cards[0].top - r.top + 22.5;
+      if (t - last > 240) { last = t; dots.push({ x: 18, y, vy: 0, alpha: 1, drop: steps.findIndex((st) => st.count && Math.random() < 0.08) }); }
+      ctx.strokeStyle = accent; ctx.globalAlpha = 0.18;
+      ctx.beginPath(); ctx.moveTo(18, y); ctx.lineTo(r.width - 18, y); ctx.stroke();
+      for (let i = dots.length - 1; i >= 0; i--) {
+        const d = dots[i], stopX = d.drop >= 0 ? cards[d.drop].right - r.left - 14 : Infinity;
+        if (d.x < stopX) d.x += 1.6; else { d.vy += 0.12; d.y += d.vy; d.alpha -= 0.03; }
+        if (d.x > r.width - 18 || d.alpha <= 0) { dots.splice(i, 1); continue; }
+        ctx.globalAlpha = d.alpha; ctx.fillStyle = d.x >= stopX ? danger : accent;
+        ctx.beginPath(); ctx.arc(d.x, d.y, 2.2, 0, 7); ctx.fill();
+      }
+      ctx.globalAlpha = 1;
+      requestAnimationFrame(loop);
+    };
+    requestAnimationFrame(loop);
+  });
+  return card({ title: "The gate today", cls: "beam", flush: true, body: h("div.flow", canvas, grid),
+    actions: h("a.btn.sm.ghost", { href: "#/usage?outcome=denied" }, "Blocked calls", icon("arrow")) });
 }
 
 async function pageOverview() {
   const [o, daily] = await Promise.all([api("GET", "/admin/overview"), api("GET", "/admin/usage/daily?days=30")]);
   const c = o.counts;
   return [
-    pageHead({ title: "Overview", sub: `${monthName(o.month)} budget month · budgets reset on ${nextReset(o.month)} (India time)` }),
-    h("div.kpis",
-      kpi("Spent this month", money(o.month_cost_usd), `≈ ${money(o.month_cost_inr, "INR")} at ₹${o.usd_inr_rate} per $1`),
-      kpi("Charged calls this month", int(o.month_requests), `${int(o.today.ok)} answered today`),
-      kpi("Blocked today", int(o.today.denied), o.today.failed ? `${int(o.today.failed)} failed today` : "Stopped before reaching a model"),
-      kpi("Active agents", `${c.agents_active} of ${c.agents_total}`, `${c.mandates_active} of ${c.mandates_total} mandates active`)),
+    pageHead({ title: "Overview" }),
+    h("section.card.kpis",
+      kpi("Spent this month", countUp(o.month_cost_usd, (x) => money(x)), `≈ ${money(o.month_cost_inr, "INR")} at ₹${o.usd_inr_rate} per $1`,
+        spark(daily.days.map((d) => Number(d.cost_usd)))),
+      kpi("Charged calls this month", countUp(o.month_requests, int, true), [h("span.ok", int(o.today.ok)), " answered today"]),
+      kpi("Blocked today", countUp(o.today.denied, int, true), "Stopped before reaching a model"),
+      kpi("Active agents", [countUp(c.agents_active, int, true), h("small", ` / ${int(c.agents_total)}`)], `${c.mandates_active} of ${c.mandates_total} mandates active`)),
+    gateCard(o.today),
     h("div.grid-2",
-      h("div.stack",
-        dailyChartCard(daily),
-        card({ title: "Blocked today, by step", hint: "Each blocked call is counted at the gate step that stopped it. None of them reached a model.", flush: true,
-          body: h("ol.gate-steps", o.today.blocked_by_step.map((st, i) => h("li", { class: st.count ? "hit" : "" },
-            h("span.gate-n", String(i + 1)), h("span.gate-label", st.label), h("span.num.gate-count", int(st.count))))) })),
+      dailyChartCard(daily),
       card({ title: "Needs attention", hint: o.attention.length ? `${o.attention.length} item${o.attention.length > 1 ? "s" : ""}` : null, flush: true,
         body: o.attention.length
-          ? h("div.list", o.attention.map((it) => h("div.list-item", h("span", { class: `dot ${it.severity}` }),
-            h("div", h("div.t", it.title), h("div.s", it.detail)), h("a.btn.sm", { href: it.link }, "Open"))))
+          ? h("div.list", o.attention.map((it) => h("a.li", { href: it.link }, h("span", { class: `sev ${it.severity}` }),
+            h("div", h("div.t", it.title), h("div.s", it.detail)), h("span.go", icon("chev")))))
           : emptyState("All clear", "No agent or mandate needs attention.") })),
-    card({ title: "Agents by spend this month", actions: h("a.btn.sm", { href: "#/agents" }, "All agents", icon("arrow")), flush: true,
-      body: table([
-        { label: "Agent", render: (a) => h("div", h("a.cell-title", { href: `#/agents/${a.id}` }, a.name), h("div.cell-sub", a.id)) },
-        { label: "Status", render: (a) => statusPill(a.status) },
-        { label: "This month", render: (a) => meter(a) },
-        { label: "Last call", render: (a) => h("span.muted", ago(a.last_request_at)) },
-      ], o.top_agents, { onRow: (a) => go(`#/agents/${a.id}`), empty: emptyState("No agents yet", "Create an agent to get started.", h("a.btn.primary", { href: "#/agents" }, "Go to agents")) }) }),
+    card({ title: "Agents by spend this month", actions: h("a.btn.sm.ghost", { href: "#/agents" }, "All agents", icon("arrow")), flush: true,
+      body: agentTable(o.top_agents, {}, true) }),
   ];
 }
 
 // ------------------------------------------------------------------ agents
+function agentTable(agents, names, short = false) {
+  return table([
+    { label: "Agent", render: (a) => h("div", h("a.ct", { href: `#/agents/${a.id}` }, a.name), h("div.cs", a.id)) },
+    { label: "Status", render: (a) => statusPill(a.status) },
+    { label: "Budget this month", render: (a) => meter(a) },
+    !short && { label: "Rate limit", render: (a) => (a.rpm_limit ? h("span.num", `${int(a.rpm_limit)}/min`) : h("span.faint", "None")) },
+    !short && { label: "Mandates", render: (a) => chips(a.mandates, { text: (id) => names[id] || id }) },
+    !short && { label: "Token", render: (a) => (a.token_issued ? h("span.pill.ok.plain", "Issued") : h("span.pill.warn.plain", "Not issued")) },
+    { label: "Last call", render: (a) => h("span.muted", ago(a.last_request_at)) },
+    goCell,
+  ].filter(Boolean), agents, { onRow: (a) => go(`#/agents/${a.id}`),
+    empty: emptyState("No agents yet", "An agent is any program that calls models through the gateway.") });
+}
+
 async function pageAgents() {
   const [agents, mandates] = await Promise.all([api("GET", "/admin/agents"), api("GET", "/admin/mandates")]);
   const names = Object.fromEntries(mandates.map((m) => [m.id, m.name]));
   return [
-    pageHead({ title: "Agents", sub: "Each agent has its own access token, monthly budget and on/off switch.",
-      actions: h("button.btn.primary", { type: "button", onclick: () => openCreateAgent(mandates) }, icon("plus"), "New agent") }),
-    card({ flush: true, body: table([
-      { label: "Agent", render: (a) => h("div", h("a.cell-title", { href: `#/agents/${a.id}` }, a.name), h("div.cell-sub", a.id)) },
-      { label: "Status", render: (a) => statusPill(a.status) },
-      { label: "Budget this month", render: (a) => meter(a) },
-      { label: "Rate limit", render: (a) => (a.rpm_limit ? `${int(a.rpm_limit)}/min` : h("span.faint", "None")) },
-      { label: "Mandates", render: (a) => chips(a.mandates.map((id) => names[id] || id), { text: true }) },
-      { label: "Token", render: (a) => (a.token_issued ? h("span.pill.ok.plain", "Issued") : h("span.pill.warn.plain", "Not issued")) },
-      { label: "Last call", render: (a) => h("span.muted", ago(a.last_request_at)) },
-    ], agents, { onRow: (a) => go(`#/agents/${a.id}`),
-      empty: emptyState("No agents yet", "An agent is any program that calls models through the gateway.",
-        h("button.btn.primary", { type: "button", onclick: () => openCreateAgent(mandates) }, icon("plus"), "New agent")) }) }),
+    pageHead({ title: "Agents", actions: h("button.btn.primary", { type: "button", onclick: () => openCreateAgent(mandates) }, icon("plus"), "New agent") }),
+    card({ flush: true, body: agentTable(agents, names) }),
   ];
 }
 
 function openCreateAgent(mandates) {
-  const m = modal({ title: "New agent", sub: "The agent gets its own access token. You'll see it once, right after creating." });
+  const m = modal({ title: "New agent", sub: "It gets its own access token. You'll see the token once, right after creating." });
   const name = input({ placeholder: "e.g. ResearchOS", maxlength: "200" });
   const id = input({ class: "mono", placeholder: "researchos", maxlength: "64" });
   let idEdited = false;
@@ -552,7 +755,8 @@ function openCreateAgent(mandates) {
   id.addEventListener("input", () => { idEdited = true; });
   const budget = budgetInput("10", "USD");
   const rpm = input({ type: "number", min: "1", step: "1", placeholder: "No limit" });
-  const checks = mandates.map((md) => h("label.check", h("input", { type: "checkbox", value: md.id }), h("span", md.name), h("span.cell-sub", md.id)));
+  const checks = mandates.map((md) => h("label.opt", h("span", h("div", md.name), h("div.cs", md.id)),
+    h("span.switch", h("input", { type: "checkbox", value: md.id, "aria-label": `Assign to ${md.name}` }))));
   const err = formError();
   const submit = h("button.btn.primary", { type: "submit", form: "create-agent" }, "Create agent");
   append(m.body, h("form.form", { id: "create-agent", onsubmit: async (e) => {
@@ -574,40 +778,39 @@ function openCreateAgent(mandates) {
   } },
   err,
   h("div.row", field("Name", name), field("ID", id, "Lowercase, numbers and dashes. Can't be changed later.")),
-  h("div.field", h("span.label", "Monthly budget"), budget.el, h("div.help", "Resets on the 1st of every month (India time).")),
-  field("Rate limit (calls per minute)", rpm, "Optional. Protects against runaway loops."),
-  h("div.field", h("span.label", "Mandates"), mandates.length ? h("div.check-list", checks) : h("div.help", "No mandates yet. You can assign one later."))));
+  h("div.field", h("span.label", "Monthly budget"), budget.el, h("div.help", "Resets on the 1st of every month, India time.")),
+  field("Rate limit (calls per minute)", rpm, "Optional. Stops runaway loops."),
+  h("div.field", h("span.label", "Mandates"), mandates.length ? h("div.opts", checks) : h("div.help", "No mandates yet. You can assign one later."))));
   append(m.foot, h("button.btn", { type: "button", onclick: m.close }, "Cancel"), submit);
 }
 
 function showToken(agentId, token, mandateIds) {
   const m = modal({ title: "Access token", sub: `For agent ${agentId}`, wide: true });
-  const base = location.origin;
   append(m.body,
-    callout("warn", h("strong", "Copy it now. "), "It won't be shown again. The gateway only keeps a fingerprint of it."),
-    h("div.secret-box", token),
-    h("div", h("button.btn", { type: "button", onclick: () => copyText(token) }, icon("copy"), "Copy token")),
+    callout("warn", h("b", "Copy it now. "), "It won't be shown again. The gateway only keeps a fingerprint of it."),
+    h("div.secret", token),
+    h("div", copyButton(token, "Copy token")),
     h("div.field", h("span.label", "How the agent connects"),
       h("div.help", "Use any OpenAI-compatible client. The token is the API key; the base URL picks the mandate."),
       mandateIds.length
-        ? mandateIds.map((mid) => h("div.field", h("span.help", `Base URL for mandate ${mid}`), copyRow(`${base}/m/${mid}/v1`, "base URL")))
+        ? mandateIds.map((mid) => h("div.field", h("span.help", `Base URL for mandate ${mid}`), copyRow(`${location.origin}/m/${mid}/v1`)))
         : h("div.help", "Assign the agent to a mandate to get its base URL.")));
   append(m.foot, h("button.btn.primary", { type: "button", onclick: m.close }, "Done"));
 }
 
 // ------------------------------------------------------------------ shared detail cards
 /** Monthly budget card for an agent or mandate. kind: "agents" | "mandates" */
-function budgetCard(kind, v, rate) {
-  const month = currentMonth();
+function budgetCard(kind, v, settings) {
+  const rate = settings.usd_inr_rate;
   const body = h("div.form");
   const view = () => body.replaceChildren(...[
-    h("div.big-number", h("strong", money(v.spent, v.budget_currency)), h("span.muted", `spent of ${money(v.budget, v.budget_currency)} this month`)),
+    h("div.big", h("strong", countUp(v.spent, (x) => money(x, v.budget_currency))), h("span.muted", `of ${money(v.budget, v.budget_currency)} this month`)),
     meter(v, true),
     h("div.facts",
       h("div.fact", h("div.k", "Remaining"), h("div.v", money(v.remaining, v.budget_currency))),
-      h("div.fact", h("div.k", "Held for calls in progress"), h("div.v", money(v.reserved, v.budget_currency))),
-      h("div.fact", h("div.k", "Resets on"), h("div.v", nextReset(month)))),
-    v.budget_currency === "INR" && h("div.help", `Spend is billed in USD (${money(v.spent_usd)}) and converted at ₹${rate} per $1. Change the rate in Settings.`),
+      h("div.fact", h("div.k", "Held for calls in flight"), h("div.v", money(v.reserved, v.budget_currency))),
+      h("div.fact", h("div.k", "Resets on"), h("div.v", dayMonth(settings.budget_resets_on)))),
+    v.budget_currency === "INR" && h("div.help", `Billed in USD (${money(v.spent_usd)}) and converted at ₹${rate} per $1. Change the rate in Settings.`),
   ].filter(Boolean));
   const edit = () => {
     const b = budgetInput(String(Number(v.budget)), v.budget_currency);
@@ -616,10 +819,12 @@ function budgetCard(kind, v, rate) {
     body.replaceChildren(h("form.form", { onsubmit: async (e) => {
       e.preventDefault();
       err.clear();
+      const next = b.get();
+      if (!(await ask("Change the monthly budget?", `New budget: ${money(next.budget, next.budget_currency)}. It applies to the next request. Below what's already spent blocks new requests until next month.`, "Save budget"))) return;
       await busy(save, async () => {
         try {
-          await api("PATCH", `/admin/${kind}/${v.id}`, b.get());
-          toast("Budget updated. It applies to the next request.");
+          await api("PATCH", `/admin/${kind}/${v.id}`, next);
+          toast("Budget saved. It applies to the next request.");
           refresh();
         } catch (ex) { err.show(ex.message); }
       });
@@ -629,22 +834,23 @@ function budgetCard(kind, v, rate) {
     b.amount.focus();
   };
   view();
-  return card({ title: "Monthly budget", hint: `${monthName(month)} · India time`,
-    actions: h("button.btn.sm", { type: "button", onclick: edit }, "Edit budget"), body });
+  return card({ title: "Monthly budget", hint: `${monthName(settings.budget_month)} · India time`,
+    actions: h("button.btn.sm", { type: "button", onclick: edit }, "Edit"), body });
 }
 
 const CHANGE_TEXT = {
   agent_created: "Agent created", agent_updated: "Agent updated", token_issued: "Token issued", token_rotated: "Token rotated",
   mandate_created: "Mandate created", mandate_updated: "Mandate updated", assigned: "Assigned to mandate",
   unassigned: "Removed from mandate", policy_updated: "Policy updated", settings_updated: "Settings updated",
+  tier_set: "Key tier set", provider_key_added: "Provider key added", provider_key_removed: "Provider key removed",
+  model_added: "Model added", model_removed: "Model removed",
 };
 const FIELD_TEXT = {
   status: "Status", name: "Name", description: "Description", budget_limit_micros: "Budget", budget_currency: "Currency",
   rpm_limit: "Rate limit", allowed_models: "Models", default_max_tokens: "Default max tokens", fallback_enabled: "Fallback",
   usd_inr_rate: "USD→INR rate",
 };
-Object.assign(CHANGE_TEXT, { tier_set: "Key tier set", provider_key_added: "Provider key added", provider_key_removed: "Provider key removed",
-  model_added: "Model added", model_removed: "Model removed" });
+const WARN_CHANGES = new Set(["unassigned", "provider_key_removed", "model_removed", "token_rotated"]);
 function fieldValue(key, v) {
   if (v == null) return key === "rpm_limit" ? "none" : "—";
   if (key === "budget_limit_micros") return String(Number(v) / 1e6);
@@ -655,29 +861,50 @@ function fieldValue(key, v) {
 function changeDetails(e) {
   const d = e.detail || {};
   if (d.changed) return Object.entries(d.changed).map(([k, c]) =>
-    h("div", h("span.muted", `${FIELD_TEXT[k] || k}: `), `${fieldValue(k, c.before)} → ${fieldValue(k, c.after)}`));
-  if (e.decision === "policy_updated") return h("div", `${d.from} → ${d.to}`, d.note ? h("span.muted", ` · ${d.note}`) : null);
-  if (d.provider_model) return h("div.muted", `${d.name} → ${d.provider_model} (key ${d.provider_key})`);
-  if (d.provider) return h("div.muted", `${d.name} · ${d.provider}`);
-  if (d.name) return h("div.muted", `${d.name}${d.budget ? ` · budget ${d.budget} ${d.currency || ""}` : ""}`);
+    h("div", h("span.faint", `${FIELD_TEXT[k] || k}: `), `${fieldValue(k, c.before)} → ${fieldValue(k, c.after)}`));
+  if (e.decision === "policy_updated") return h("div", `${d.from} → ${d.to}`, d.note ? h("span.faint", ` · ${d.note}`) : null);
+  if (d.provider_model) return h("div", `${d.name} → ${d.provider_model} (key ${d.provider_key})`);
+  if (d.provider) return h("div", `${d.name} · ${d.provider}`);
+  if (d.name) return h("div", `${d.name}${d.budget ? ` · budget ${d.budget} ${d.currency || ""}` : ""}`);
   return null;
 }
-function activityList(events) {
+const changeTone = (e) => (WARN_CHANGES.has(e.decision) || ["suspended", "revoked"].includes(e.detail?.changed?.status?.after) ? "warn" : "info");
+
+/** Changes as a timeline, grouped under the day they happened. */
+function timeline(events, { links = true } = {}) {
   if (!events.length) return emptyState("No changes yet");
-  return h("div.list", events.map((e) => h("div.list-item", h("span.dot.info"),
-    h("div", h("div.t", CHANGE_TEXT[e.decision] || e.decision), h("div.s", changeDetails(e))), h("span.faint", when(e.at)))));
+  const days = [];
+  for (const e of events) {
+    const day = new Date(e.at).toDateString();
+    if (days.at(-1)?.day !== day) days.push({ day, events: [] });
+    days.at(-1).events.push(e);
+  }
+  const today = new Date().toDateString();
+  return h("div.tl", days.map(({ day, events: evs }) => [
+    h("div.day", day === today ? "Today" : dayLong.format(new Date(day))),
+    evs.map((e) => h("div.ev", h("span", { class: `dot ${changeTone(e)}` }),
+      h("div", h("div.t", CHANGE_TEXT[e.decision] || e.decision), h("div.s", changeDetails(e)),
+        links && (e.agent_id || e.mandate_id) && h("div.chips",
+          e.agent_id && h("a.chip", { href: `#/agents/${e.agent_id}` }, e.agent_id),
+          e.mandate_id && h("a.chip", { href: `#/mandates/${e.mandate_id}` }, e.mandate_id))),
+      h("span.when", timeOnly.format(new Date(e.at))))),
+  ]));
 }
 
 // ------------------------------------------------------------------ agent detail
 async function pageAgent(id) {
   const [a, mandates, daily, recent, events, settings] = await Promise.all([
     api("GET", `/admin/agents/${id}`), api("GET", "/admin/mandates"), api("GET", `/admin/usage/daily?days=30&agent=${id}`),
-    api("GET", `/admin/usage?agent=${id}&limit=8`), api("GET", `/admin/audit?agent=${id}&limit=8`), api("GET", "/admin/settings")]);
+    api("GET", `/admin/usage?agent=${id}&limit=8`), api("GET", `/admin/audit?agent=${id}&limit=12`), api("GET", "/admin/settings")]);
   const names = Object.fromEntries(mandates.map((m) => [m.id, m.name]));
 
+  const STATUS_ASK = {
+    active: [`Set ${a.name} active?`, "Its token works again and its requests are checked as normal.", "Set active", false],
+    suspended: [`Suspend ${a.name}?`, "Every request it makes is blocked until you set it active again.", "Suspend agent", true],
+    revoked: [`Revoke ${a.name}?`, "Its token stops working immediately and every request is blocked. You can restore it later.", "Revoke agent", true],
+  };
   const setStatus = async (to) => {
-    if (to === "revoked" && !(await confirmDialog({ title: `Revoke ${a.name}?`, danger: true, confirm: "Revoke agent",
-      message: "Its token stops working immediately and every request is blocked. You can restore it later." }))) return refresh();
+    if (!(await ask(...STATUS_ASK[to]))) return false;
     try {
       await api("PATCH", `/admin/agents/${id}`, { status: to });
       toast(to === "active" ? `${a.name} is active again.` : `${a.name} is ${to}. New requests are blocked.`);
@@ -686,8 +913,7 @@ async function pageAgent(id) {
   };
 
   const rotate = async () => {
-    if (a.token_issued && !(await confirmDialog({ title: "Rotate token?", confirm: "Rotate token", danger: true,
-      message: "The current token stops working immediately. Put the new one in the agent's configuration." }))) return;
+    if (a.token_issued && !(await ask("Rotate token?", "The current token stops working immediately. Put the new one in the agent's configuration.", "Rotate token", true))) return;
     try {
       const { token } = await api("POST", `/admin/agents/${id}/token`);
       showToken(id, token, a.mandates);
@@ -695,108 +921,127 @@ async function pageAgent(id) {
     } catch (ex) { toast(ex.message, "error"); }
   };
 
-  const assignToggle = (md) => toggle(md.name, a.mandates.includes(md.id), async (on) => {
-    try {
-      await api(on ? "PUT" : "DELETE", `/admin/agents/${id}/mandates/${md.id}`);
-      toast(on ? `Assigned to ${md.name}.` : `Removed from ${md.name}. Its requests there are blocked.`);
-    } catch (ex) { toast(ex.message, "error"); }
-    refresh();
-  });
+  const assignSwitch = (md) => h("span.switch", h("input", { type: "checkbox", role: "switch", checked: a.mandates.includes(md.id), "aria-label": `Assign to ${md.name}`,
+    onchange: async (e) => {
+      const on = e.target.checked;
+      if (!on && !(await ask(`Remove ${a.name} from ${md.name}?`, "Its requests under this mandate are blocked straight away.", "Remove", true))) { e.target.checked = true; return; }
+      try {
+        await api(on ? "PUT" : "DELETE", `/admin/agents/${id}/mandates/${md.id}`);
+        toast(on ? `Assigned to ${md.name}.` : `Removed from ${md.name}. Its requests there are blocked.`);
+      } catch (ex) { toast(ex.message, "error"); }
+      refresh();
+    } }));
 
   const rpm = input({ type: "number", min: "1", step: "1", placeholder: "No limit", value: a.rpm_limit ?? "" });
-  const saveRpm = h("button.btn", { type: "submit" }, "Save");
   const name = input({ value: a.name, maxlength: "200" });
-  const saveName = h("button.btn", { type: "submit" }, "Save");
-  const patch = (btn, body, msg) => busy(btn, async () => {
-    try { await api("PATCH", `/admin/agents/${id}`, body); toast(msg); refresh(); } catch (ex) { toast(ex.message, "error"); }
-  });
+  const saveLimits = h("button.btn", { type: "submit" }, "Save");
 
   return [
-    pageHead({
-      crumbs: [h("a", { href: "#/agents" }, "Agents"), " / "],
-      title: a.name, badge: statusPill(a.status),
+    pageHead({ back: "agents", title: a.name, badge: statusPill(a.status),
       sub: [h("span.mono", a.id), ` · last call ${ago(a.last_request_at).toLowerCase()}`],
-      actions: segmented([["active", "Active", "ok"], ["suspended", "Suspended", "warn"], ["revoked", "Revoked", "danger"]],
-        a.status, setStatus, "Agent status"),
-    }),
+      actions: segmented([["active", "Active", "ok"], ["suspended", "Suspended", "warn"], ["revoked", "Revoked", "danger"]], a.status, setStatus, "Agent status") }),
     a.status !== "active" && callout(a.status === "revoked" ? "danger" : "warn",
-      h("strong", `This agent is ${a.status}. `), "Every request it makes is blocked before reaching a model."),
+      h("b", `This agent is ${a.status}. `), "Every request it makes is blocked before reaching a model."),
     h("div.grid-2",
       h("div.stack",
-        budgetCard("agents", a, settings.usd_inr_rate),
-        dailyChartCard(daily, "Daily spend"),
-        card({ title: "Recent calls", actions: h("a.btn.sm", { href: `#/usage?agent=${id}` }, "All calls", icon("arrow")), flush: true,
+        budgetCard("agents", a, settings),
+        dailyChartCard(daily),
+        card({ title: "Recent calls", actions: h("a.btn.sm.ghost", { href: `#/usage?agent=${id}` }, "All calls", icon("arrow")), flush: true,
           body: usageTable(recent, { agent: false, compact: true }) })),
       h("div.stack",
-        card({ title: "Access token", hint: "How this agent signs in to the gateway",
-          actions: h("button.btn.sm", { type: "button", onclick: rotate }, icon("key"), a.token_issued ? "Rotate token" : "Issue token"),
+        card({ title: "Access token", actions: h("button.btn.sm", { type: "button", onclick: rotate }, icon("key"), a.token_issued ? "Rotate" : "Issue token"),
           body: [
-            a.token_issued ? h("div", h("span.pill.ok.plain", "Issued"), h("span.muted", " Only a fingerprint is stored; the token itself can't be shown again."))
+            a.token_issued ? h("div.muted", h("span.pill.ok.plain", "Issued"), " Only a fingerprint is stored.")
               : callout("warn", "No token yet. Issue one so the agent can make calls."),
             a.mandates.length
-              ? a.mandates.map((mid) => h("div.field", h("span.help", `Base URL for ${names[mid] || mid}`), copyRow(`${location.origin}/m/${mid}/v1`, "base URL")))
+              ? a.mandates.map((mid) => h("div.field", h("span.help", `Base URL for ${names[mid] || mid}`), copyRow(`${location.origin}/m/${mid}/v1`)))
               : h("div.help", "Assign a mandate below to get a base URL."),
           ] }),
-        card({ title: "Mandates", hint: "What this agent may work on. Each mandate has its own models and budget.",
-          body: mandates.length ? h("div.check-list", mandates.map((md) => h("div.check", assignToggle(md),
-            h("a.cell-sub", { href: `#/mandates/${md.id}` }, md.id)))) : h("div.help", "No mandates yet. Create one under Mandates.") }),
-        card({ title: "Rate limit", hint: "Model calls per minute, including fallback attempts",
-          body: h("form.row", { onsubmit: (e) => { e.preventDefault(); patch(saveRpm, { rpm_limit: Number(rpm.value) || 0 }, "Rate limit saved."); } },
-            field("Calls per minute", rpm, "Leave empty for no limit."), h("div.field", h("span.label", " "), saveRpm)) }),
-        card({ title: "Details",
-          body: h("form.row", { onsubmit: (e) => { e.preventDefault(); patch(saveName, { name: name.value.trim() }, "Name saved."); } },
-            field("Name", name), h("div.field", h("span.label", " "), saveName)) }),
-        card({ title: "Recent changes", flush: true, body: activityList(events) }))),
+        card({ title: "Mandates", body: mandates.length
+          ? h("div.opts", mandates.map((md) => h("div.opt", h("span", h("a.link", { href: `#/mandates/${md.id}` }, md.name), h("div.cs", md.id)), assignSwitch(md))))
+          : h("div.help", "No mandates yet. Create one under Mandates.") }),
+        card({ title: "Limits and details", body: h("form.form", { onsubmit: async (e) => {
+          e.preventDefault();
+          if (!(await ask("Save limits and details?", "The rate limit applies to the next request.", "Save"))) return;
+          await busy(saveLimits, async () => {
+            try {
+              await api("PATCH", `/admin/agents/${id}`, { name: name.value.trim(), rpm_limit: Number(rpm.value) || 0 });
+              toast("Saved.");
+              refresh();
+            } catch (ex) { toast(ex.message, "error"); }
+          });
+        } }, h("div.row", field("Name", name), field("Calls per minute", rpm, "Includes fallback attempts. Empty = no limit.")),
+        h("div.form-actions", saveLimits)) }),
+        card({ title: "Recent changes", flush: true, body: timeline(events, { links: false }) }))),
   ];
 }
 
 /** Usage records table. opts: { agent: show agent column, compact } */
 function usageTable(rows, { agent = true, mandate = true, compact = false, tiers = {} } = {}) {
   const cols = [
-    { label: "Time", render: (r) => h("span.num", when(r.at)) },
-    agent && { label: "Agent", render: (r) => h("a", { href: `#/agents/${r.agent_id}` }, r.agent_id) },
-    mandate && !compact && { label: "Mandate", render: (r) => (r.mandate_id ? h("span.mono", r.mandate_id) : "—") },
+    { label: "Time", render: (r) => h("span.num.muted", when(r.at)) },
+    agent && { label: "Agent", render: (r) => h("a.mono.link", { href: `#/agents/${r.agent_id}` }, r.agent_id) },
+    mandate && !compact && { label: "Mandate", render: (r) => (r.mandate_id ? h("span.mono.muted", r.mandate_id) : "—") },
     { label: "Model", render: (r) => {
       if (!r.model_requested) return h("span.faint", "—");
       if (r.model_served && r.model_served !== r.model_requested) {
-        return h("div", h("div.mono", r.model_served), h("div.cell-sub", `fallback from ${r.model_requested}`));
+        return h("div", h("div.mono", r.model_served), h("div.cs", `fallback from ${r.model_requested}`));
       }
       return h("span.mono", r.model_requested);
     } },
-    { label: "Result", render: (r) => h("div", outcomePill(r.outcome), r.reason_code && h("div.cell-sub", reasonText(r.reason_code))) },
+    { label: "Result", render: (r) => h("div", outcomePill(r.outcome), r.reason_code && h("div.cs.sans", reasonText(r.reason_code))) },
     !compact && { label: "Tokens in / out", align: "r", render: (r) => (r.prompt_tokens == null ? h("span.faint", "—") : h("span.num", `${int(r.prompt_tokens)} / ${int(r.completion_tokens)}`)) },
-    !compact && { label: "Held (estimate)", align: "r", render: (r) => h("span.num.faint", Number(r.reserved_usd) ? money(r.reserved_usd) : "—") },
-    { label: compact ? "Cost" : "Charged (actual)", align: "r", render: (r) => h("div",
-      h("span.num", Number(r.cost_usd) ? money(r.cost_usd) : "—"),
-      tiers[r.model_served] === "free" && Number(r.cost_usd) ? h("div.cell-sub", { title: "Charged at list price; a free-tier key pays $0" }, "free tier") : null) },
+    !compact && { label: "Held", align: "r", title: "The most the call could cost, reserved before it ran. Never charged; only the charged amount counts against budgets.",
+      render: (r) => h("span.num.faint", Number(r.reserved_usd) ? money(r.reserved_usd) : "—") },
+    { label: compact ? "Cost" : "Charged", align: "r", title: compact ? null : "The real cost: tokens the provider reported × the model's list price, including cache discounts.",
+      render: (r) => h("div",
+        h("span.num", Number(r.cost_usd) ? money(r.cost_usd) : "—"),
+        tiers[r.model_served] === "free" && Number(r.cost_usd) ? h("div.cs", { title: "Charged at list price; a free-tier key pays $0" }, "free tier") : null) },
     !compact && { label: "Took", align: "r", render: (r) => h("span.num.muted", r.latency_ms == null ? "—" : r.latency_ms < 1000 ? `${r.latency_ms} ms` : `${(r.latency_ms / 1000).toFixed(1)} s`) },
   ].filter(Boolean);
-  return table(cols, rows, { empty: emptyState("No calls yet", "Calls appear here as soon as the agent makes them.") });
+  return table(cols, rows, { empty: emptyState("No calls yet", "Calls appear here as soon as an agent makes them.") });
 }
 
 // ------------------------------------------------------------------ mandates
-/** Ordered model list editor. The first model is the primary; the rest are tried in order when it's busy. */
+/** Ordered model list editor: drag or arrows. The first model is the primary; the rest are tried in order.
+    Fires "change" on el whenever the list changes. */
 function modelOrderEditor(initial, models) {
   let list = [...initial];
+  let dragFrom = null;
   const priceOf = Object.fromEntries(models.map((m) => [m.model, m]));
   const el = h("div.form");
+  const changed = () => { draw(); el.dispatchEvent(new Event("change")); };
   const draw = () => {
     const rest = models.map((m) => m.model).filter((m) => !list.includes(m));
     const pick = select([["", rest.length ? "Choose a model…" : "All models added"], ...rest.map((m) => [m, m])], "", { "aria-label": "Model to add" });
-    const move = (i, d) => { [list[i], list[i + d]] = [list[i + d], list[i]]; draw(); };
+    const move = (i, d) => { [list[i], list[i + d]] = [list[i + d], list[i]]; changed(); };
     el.replaceChildren(
-      list.length ? h("ol.order-list", { "aria-label": "Allowed models in fallback order" }, list.map((m, i) => {
+      list.length ? h("ol.order", { "aria-label": "Allowed models in fallback order" }, list.map((m, i) => {
         const p = priceOf[m];
-        return h("li.order-item", h("span.idx", String(i + 1)),
+        const li = h("li.oi", { draggable: "true" }, h("span.grip", icon("grip")), h("span.idx", String(i + 1)),
           h("div", h("div.name", m), h("div.role", [i === 0 ? "Primary" : `Fallback ${i}`,
-            p ? ` · $${Number(p.input_usd_per_1m)} in / $${Number(p.output_usd_per_1m)} out per 1M tokens` : " · not configured in LiteLLM"])),
+            p ? ` · $${Number(p.input_usd_per_1m)} in / $${Number(p.output_usd_per_1m)} out per 1M` : " · not configured in LiteLLM",
+            p?.tier === "free" ? " · free tier" : ""])),
           h("div.tools",
-            h("button.btn.ghost.icon", { type: "button", "aria-label": `Move ${m} up`, disabled: i === 0, onclick: () => move(i, -1) }, icon("up")),
-            h("button.btn.ghost.icon", { type: "button", "aria-label": `Move ${m} down`, disabled: i === list.length - 1, onclick: () => move(i, 1) }, icon("down")),
-            h("button.btn.ghost.icon", { type: "button", "aria-label": `Remove ${m}`, onclick: () => { list = list.filter((x) => x !== m); draw(); } }, icon("x"))));
+            h("button.btn.ghost.sm.icon", { type: "button", "aria-label": `Move ${m} up`, disabled: i === 0, onclick: () => move(i, -1) }, icon("up")),
+            h("button.btn.ghost.sm.icon", { type: "button", "aria-label": `Move ${m} down`, disabled: i === list.length - 1, onclick: () => move(i, 1) }, icon("down")),
+            h("button.btn.ghost.sm.icon", { type: "button", "aria-label": `Remove ${m}`, onclick: () => { list = list.filter((x) => x !== m); changed(); } }, icon("x"))));
+        li.addEventListener("dragstart", () => { dragFrom = i; li.classList.add("drag"); });
+        li.addEventListener("dragend", () => li.classList.remove("drag"));
+        li.addEventListener("dragover", (e) => { e.preventDefault(); li.classList.add("over"); });
+        li.addEventListener("dragleave", () => li.classList.remove("over"));
+        li.addEventListener("drop", (e) => {
+          e.preventDefault();
+          if (dragFrom == null || dragFrom === i) return draw();
+          const [x] = list.splice(dragFrom, 1);
+          list.splice(i, 0, x);
+          dragFrom = null;
+          changed();
+        });
+        return li;
       })) : h("div.help", "No models yet. Agents can't make calls under this mandate until you add one."),
-      h("div.input-group", pick, h("button.btn", { type: "button", disabled: !rest.length, onclick: () => {
-        if (pick.value) { list.push(pick.value); draw(); }
+      h("div.group", pick, h("button.btn", { type: "button", disabled: !rest.length, onclick: () => {
+        if (pick.value) { list.push(pick.value); changed(); }
       } }, icon("plus"), "Add")));
   };
   draw();
@@ -806,22 +1051,20 @@ function modelOrderEditor(initial, models) {
 async function pageMandates() {
   const [mandates, models] = await Promise.all([api("GET", "/admin/mandates"), api("GET", "/admin/models")]);
   return [
-    pageHead({ title: "Mandates", sub: "A mandate is a piece of work: which models may be used for it, in what order, and its monthly budget.",
-      actions: h("button.btn.primary", { type: "button", onclick: () => openCreateMandate(models) }, icon("plus"), "New mandate") }),
+    pageHead({ title: "Mandates", actions: h("button.btn.primary", { type: "button", onclick: () => openCreateMandate(models) }, icon("plus"), "New mandate") }),
     card({ flush: true, body: table([
-      { label: "Mandate", render: (m) => h("div", h("a.cell-title", { href: `#/mandates/${m.id}` }, m.name), h("div.cell-sub", m.id)) },
+      { label: "Mandate", render: (m) => h("div", h("a.ct", { href: `#/mandates/${m.id}` }, m.name), h("div.cs", m.id)) },
       { label: "Status", render: (m) => statusPill(m.status) },
       { label: "Budget this month", render: (m) => meter(m) },
-      { label: "Models (fallback order)", render: (m) => chips(m.allowed_models, { lead: true, arrows: m.fallback_enabled }) },
+      { label: "Models in fallback order", render: (m) => chips(m.allowed_models, { lead: true, arrows: m.fallback_enabled }) },
       { label: "Agents", align: "r", render: (m) => h("span.num", int(m.agents.length)) },
-    ], mandates, { onRow: (m) => go(`#/mandates/${m.id}`),
-      empty: emptyState("No mandates yet", "Create one, then assign agents to it.",
-        h("button.btn.primary", { type: "button", onclick: () => openCreateMandate(models) }, icon("plus"), "New mandate")) }) }),
+      goCell,
+    ], mandates, { onRow: (m) => go(`#/mandates/${m.id}`), empty: emptyState("No mandates yet", "Create one, then assign agents to it.") }) }),
   ];
 }
 
 function openCreateMandate(models) {
-  const m = modal({ title: "New mandate", sub: "Agents assigned to it can use only these models, within its monthly budget.", wide: true });
+  const m = modal({ title: "New mandate", sub: "Agents on it can use only these models, within its monthly budget.", wide: true });
   const name = input({ placeholder: "e.g. ResearchOS development", maxlength: "200" });
   const id = input({ class: "mono", placeholder: "researchos-dev", maxlength: "64" });
   let idEdited = false;
@@ -853,9 +1096,9 @@ function openCreateMandate(models) {
   err,
   h("div.row", field("Name", name), field("ID", id, "Part of the agent's base URL. Can't be changed later.")),
   field("Description", description),
-  h("div.field", h("span.label", "Monthly budget"), budget.el, h("div.help", "Shared by every agent on this mandate. Each agent also has its own budget.")),
-  h("div.field", h("span.label", "Models"), h("div.help", "The first is the primary. If it's busy, the next ones are tried in order."), order.el),
-  h("div.row", field("Default answer limit (tokens)", maxTokens, "Used when an agent doesn't set max_tokens. Lower = smaller budget holds."),
+  h("div.field", h("span.label", "Monthly budget"), budget.el, h("div.help", "Shared by every agent on it. Each agent also has its own budget.")),
+  h("div.field", h("span.label", "Models"), h("div.help", "The first is the primary. Drag to reorder."), order.el),
+  h("div.row", field("Default answer limit (tokens)", maxTokens, "Used when an agent doesn't set max_tokens."),
     h("div.field", h("span.label", "Fallback"), fallback))));
   append(m.foot, h("button.btn", { type: "button", onclick: m.close }, "Cancel"), submit);
 }
@@ -864,11 +1107,15 @@ async function pageMandate(id) {
   const [md, agents, models, daily, recent, events, settings] = await Promise.all([
     api("GET", `/admin/mandates/${id}`), api("GET", "/admin/agents"), api("GET", "/admin/models"),
     api("GET", `/admin/usage/daily?days=30&mandate=${id}`), api("GET", `/admin/usage?mandate=${id}&limit=8`),
-    api("GET", `/admin/audit?mandate=${id}&limit=8`), api("GET", "/admin/settings")]);
+    api("GET", `/admin/audit?mandate=${id}&limit=12`), api("GET", "/admin/settings")]);
+  const assigned = agents.filter((a) => md.agents.includes(a.id));
+  const unassigned = agents.filter((a) => !md.agents.includes(a.id));
 
   const setStatus = async (to) => {
-    if (to === "suspended" && !(await confirmDialog({ title: `Suspend ${md.name}?`, confirm: "Suspend mandate", danger: true,
-      message: `Every request under this mandate is blocked, for all ${md.agents.length} assigned agent(s).` }))) return refresh();
+    const confirmed = to === "suspended"
+      ? await ask(`Suspend ${md.name}?`, `Every request under it is blocked, for all ${assigned.length} assigned agent(s).`, "Suspend mandate", true)
+      : await ask(`Set ${md.name} active?`, "Its agents can make calls under it again.", "Set active");
+    if (!confirmed) return false;
     try {
       await api("PATCH", `/admin/mandates/${id}`, { status: to });
       toast(to === "active" ? `${md.name} is active again.` : `${md.name} is suspended.`);
@@ -879,16 +1126,19 @@ async function pageMandate(id) {
   const order = modelOrderEditor(md.allowed_models, models);
   const fallback = toggle("Try the next model when one is busy", md.fallback_enabled);
   const maxTokens = input({ type: "number", min: "1", max: "65536", step: "1", value: md.default_max_tokens });
-  const saveModels = h("button.btn.primary", { type: "submit" }, "Save models");
+  const saveModels = h("button.btn.primary", { type: "submit", disabled: true }, "Save models");
+  const enable = () => { saveModels.disabled = false; };
+  order.el.addEventListener("change", enable);
+  fallback.input.addEventListener("change", enable);
+  maxTokens.addEventListener("input", enable);
   const modelsErr = formError();
 
-  const assigned = agents.filter((a) => md.agents.includes(a.id));
-  const unassigned = agents.filter((a) => !md.agents.includes(a.id));
-  const addAgent = select([["", unassigned.length ? "Choose an agent…" : "All agents assigned"], ...unassigned.map((a) => [a.id, a.name])], "", { "aria-label": "Agent to assign" });
-  const assign = async (agentId, on) => {
+  const pick = select([["", unassigned.length ? "Choose an agent…" : "All agents assigned"], ...unassigned.map((a) => [a.id, a.name])], "", { "aria-label": "Agent to assign" });
+  const assign = async (agent, on) => {
+    if (!on && !(await ask(`Remove ${agent.name} from ${md.name}?`, "Its requests under this mandate are blocked straight away.", "Remove", true))) return;
     try {
-      await api(on ? "PUT" : "DELETE", `/admin/agents/${agentId}/mandates/${id}`);
-      toast(on ? "Agent assigned." : "Agent removed. Its requests under this mandate are blocked.");
+      await api(on ? "PUT" : "DELETE", `/admin/agents/${agent.id}/mandates/${id}`);
+      toast(on ? `${agent.name} assigned.` : `${agent.name} removed. Its requests under this mandate are blocked.`);
     } catch (ex) { toast(ex.message, "error"); }
     refresh();
   };
@@ -898,49 +1148,50 @@ async function pageMandate(id) {
   const saveDetails = h("button.btn", { type: "submit" }, "Save details");
 
   return [
-    pageHead({ crumbs: [h("a", { href: "#/mandates" }, "Mandates"), " / "], title: md.name, badge: statusPill(md.status),
-      sub: [h("span.mono", id), md.description ? ` · ${md.description}` : ""],
+    pageHead({ back: "mandates", title: md.name, badge: statusPill(md.status), sub: [h("span.mono", id), md.description ? ` · ${md.description}` : ""],
       actions: segmented([["active", "Active", "ok"], ["suspended", "Suspended", "warn"]], md.status, setStatus, "Mandate status") }),
-    md.status !== "active" && callout("warn", h("strong", "This mandate is suspended. "), "Every request under it is blocked."),
+    md.status !== "active" && callout("warn", h("b", "This mandate is suspended. "), "Every request under it is blocked."),
     h("div.grid-2",
       h("div.stack",
-        budgetCard("mandates", md, settings.usd_inr_rate),
-        dailyChartCard(daily, "Daily spend"),
-        card({ title: "Recent calls", actions: h("a.btn.sm", { href: `#/usage?mandate=${id}` }, "All calls", icon("arrow")), flush: true,
+        budgetCard("mandates", md, settings),
+        dailyChartCard(daily),
+        card({ title: "Recent calls", actions: h("a.btn.sm.ghost", { href: `#/usage?mandate=${id}` }, "All calls", icon("arrow")), flush: true,
           body: usageTable(recent, { mandate: false, compact: true }) })),
       h("div.stack",
-        card({ title: "Models", hint: "Only these models can be used. Order = fallback order.",
-          body: h("form.form", { onsubmit: async (e) => {
-            e.preventDefault();
-            modelsErr.clear();
-            await busy(saveModels, async () => {
-              try {
-                await api("PATCH", `/admin/mandates/${id}`, { allowed_models: order.get(), fallback_enabled: fallback.input.checked,
-                  default_max_tokens: Number(maxTokens.value) || 4096 });
-                toast("Models saved. They apply to the next request.");
-                refresh();
-              } catch (ex) { modelsErr.show(ex.message); }
-            });
-          } }, modelsErr, order.el, fallback,
-          field("Default answer limit (tokens)", maxTokens, "Used when an agent doesn't set max_tokens. It caps the answer length and the budget hold."),
-          h("div.form-actions", saveModels)) }),
-        card({ title: "Agents", hint: `${assigned.length} assigned`, flush: true, body: [
-          assigned.length ? h("div.list", assigned.map((a) => h("div.list-item", h("span", { class: `dot ${STATUS_TONE[a.status]}` }),
-            h("div", h("a.t", { href: `#/agents/${a.id}` }, a.name), h("div.s", `${titleCase(a.status)} · ${money(a.spent, a.budget_currency)} spent this month`)),
-            h("button.btn.sm", { type: "button", onclick: () => assign(a.id, false) }, "Remove")))) : emptyState("No agents assigned"),
-          h("div.toolbar", h("div.input-group", addAgent, h("button.btn", { type: "button", disabled: !unassigned.length,
-            onclick: () => addAgent.value && assign(addAgent.value, true) }, icon("plus"), "Assign"))),
-        ] }),
-        card({ title: "Details", body: h("form.form", { onsubmit: (e) => {
+        card({ title: "Models", body: h("form.form", { onsubmit: async (e) => {
           e.preventDefault();
-          busy(saveDetails, async () => {
+          modelsErr.clear();
+          if (!(await ask("Save models?", `Agents on ${md.name} can use only these models, in this order, from the next request.`, "Save models"))) return;
+          await busy(saveModels, async () => {
+            try {
+              await api("PATCH", `/admin/mandates/${id}`, { allowed_models: order.get(), fallback_enabled: fallback.input.checked,
+                default_max_tokens: Number(maxTokens.value) || 4096 });
+              toast("Models saved. They apply to the next request.");
+              refresh();
+            } catch (ex) { modelsErr.show(ex.message); }
+          });
+        } }, modelsErr, order.el, fallback,
+        field("Default answer limit (tokens)", maxTokens, "Caps answer length and the budget hold when an agent doesn't set max_tokens."),
+        h("div.form-actions", saveModels)) }),
+        card({ title: "Agents", hint: `${assigned.length} assigned`, flush: true, body: [
+          assigned.length ? h("div.list", assigned.map((a) => h("div.li", h("span", { class: `dot ${STATUS_TONE[a.status]}` }),
+            h("div", h("a.t", { href: `#/agents/${a.id}` }, a.name), h("div.s", `${titleCase(a.status)} · ${money(a.spent, a.budget_currency)} spent this month`)),
+            h("button.btn.sm.ghost", { type: "button", onclick: () => assign(a, false) }, "Remove")))) : emptyState("No agents assigned"),
+          h("div.card-pad", h("div.group", pick, h("button.btn", { type: "button", disabled: !unassigned.length,
+            onclick: () => { const a = unassigned.find((x) => x.id === pick.value); if (a) assign(a, true); } }, icon("plus"), "Assign"))),
+        ] }),
+        card({ title: "Details", body: h("form.form", { onsubmit: async (e) => {
+          e.preventDefault();
+          if (!(await ask("Save details?", "The name and description change everywhere in the console.", "Save details"))) return;
+          await busy(saveDetails, async () => {
             try {
               await api("PATCH", `/admin/mandates/${id}`, { name: name.value.trim(), description: description.value.trim() });
-              toast("Details saved."); refresh();
+              toast("Details saved.");
+              refresh();
             } catch (ex) { toast(ex.message, "error"); }
           });
         } }, field("Name", name), field("Description", description), h("div.form-actions", saveDetails)) }),
-        card({ title: "Recent changes", flush: true, body: activityList(events) }))),
+        card({ title: "Recent changes", flush: true, body: timeline(events, { links: false }) }))),
   ];
 }
 
@@ -952,16 +1203,11 @@ function setQuery(q, changes) {
 
 async function pageUsage(q) {
   const tab = q.get("tab") === "monthly" ? "monthly" : "requests";
-  const tabs = h("div.tabs", { role: "tablist" },
-    [["requests", "Calls"], ["monthly", "Monthly totals"]].map(([t, label]) =>
-      h("button", { type: "button", role: "tab", "aria-selected": String(t === tab), onclick: () => setQuery(q, { tab: t === "requests" ? "" : t }) }, label)));
-  const head = pageHead({ title: "Usage", sub: "Every call an agent made through the gateway. Raw calls are kept 90 days; monthly totals are kept forever." });
-  // Two money columns on purpose: "Held" is the worst case reserved before the call (never charged), "Charged" is
-  // the real cost from the tokens the provider reported. Showing both makes it obvious which one counts.
-  const explain = callout("", h("strong", "Held vs charged. "), "Before each call the gateway holds the most it could cost (the estimate). " +
-    "After the answer, it charges the real cost: the tokens the provider reported × the model's price, including cache discounts. Only the charged amount counts against budgets. " +
-    "Amounts use list prices; calls on a key tagged \"free tier\" cost you $0.");
-  return [head, explain, tabs, tab === "monthly" ? await usageMonthly(q) : await usageRequests(q)];
+  return [
+    pageHead({ title: "Usage" }),
+    tabs([["requests", "Calls"], ["monthly", "Monthly totals"]], tab, (t) => setQuery(q, { tab: t === "requests" ? "" : t })),
+    tab === "monthly" ? await usageMonthly(q) : await usageRequests(q),
+  ];
 }
 
 async function usageRequests(q) {
@@ -969,23 +1215,24 @@ async function usageRequests(q) {
   const params = new URLSearchParams(Object.entries(filters).filter(([, v]) => v));
   const [rows, agents, mandates, models] = await Promise.all([
     api("GET", `/admin/usage?limit=50&${params}`), api("GET", "/admin/agents"), api("GET", "/admin/mandates"), api("GET", "/admin/models")]);
+  const pick = (label, key, options) => field(label, select([["", "All"], ...options], filters[key], { onchange: (e) => setQuery(q, { [key]: e.target.value }) }));
   const bar = h("div.toolbar",
-    field("Agent", select([["", "All agents"], ...agents.map((a) => [a.id, a.name])], filters.agent, { onchange: (e) => setQuery(q, { agent: e.target.value }) })),
-    field("Mandate", select([["", "All mandates"], ...mandates.map((m) => [m.id, m.name])], filters.mandate, { onchange: (e) => setQuery(q, { mandate: e.target.value }) })),
-    field("Result", select([["", "All results"], ["ok", "Answered"], ["denied", "Blocked"], ["error", "Failed"], ["timeout", "Timed out"]], filters.outcome, { onchange: (e) => setQuery(q, { outcome: e.target.value }) })),
-    field("Model", select([["", "All models"], ...models.map((m) => [m.model, m.model])], filters.model, { onchange: (e) => setQuery(q, { model: e.target.value }) })),
-    Object.values(filters).some(Boolean) && h("div.field", h("span.label", " "), h("button.btn.ghost", { type: "button", onclick: () => go("#/usage") }, "Clear filters")));
+    pick("Agent", "agent", agents.map((a) => [a.id, a.name])),
+    pick("Mandate", "mandate", mandates.map((m) => [m.id, m.name])),
+    pick("Result", "outcome", [["ok", "Answered"], ["denied", "Blocked"], ["error", "Failed"], ["timeout", "Timed out"]]),
+    pick("Model", "model", models.map((m) => [m.model, m.model])),
+    Object.values(filters).some(Boolean) && h("button.btn.ghost", { type: "button", onclick: () => go("#/usage") }, icon("x"), "Clear filters"));
   const tiers = Object.fromEntries(models.map((m) => [m.model, m.tier]));
   const holder = h("div", usageTable(rows, { tiers }));
   let last = rows.length ? rows[rows.length - 1].id : null;
-  const more = h("button.btn", { type: "button", onclick: () => busy(more, async () => {
+  const more = h("button.btn.sm", { type: "button", onclick: () => busy(more, async () => {
     const next = await api("GET", `/admin/usage?limit=50&before_id=${last}&${params}`);
     rows.push(...next);
     last = rows.length ? rows[rows.length - 1].id : null;
     holder.replaceChildren(usageTable(rows, { tiers }));
     if (next.length < 50) more.remove();
   }) }, "Load older calls");
-  return card({ flush: true, body: [bar, holder], foot: rows.length === 50 && h("div.toolbar", more) });
+  return card({ flush: true, body: [bar, holder], foot: rows.length === 50 && more });
 }
 
 async function usageMonthly(q) {
@@ -994,10 +1241,9 @@ async function usageMonthly(q) {
   const data = await api("GET", `/admin/usage/monthly?${params}`);
   const href = { agent: (k) => `#/agents/${k}`, mandate: (k) => `#/mandates/${k}`, model: null }[by];
   const share = (r) => {
-    const track = h("div.meter-track"), fill = h("div.meter-fill");
+    const fill = h("div.fill");
     fill.style.width = `${r.share_pct}%`;
-    track.append(fill);
-    return h("div.meter", { title: `${r.share_pct}% of the month's cost` }, track);
+    return h("div.meter.share", { title: `${r.share_pct}% of the month's cost` }, h("div.track", fill));
   };
   const t = data.totals;
   return card({ flush: true, body: [
@@ -1007,7 +1253,7 @@ async function usageMonthly(q) {
       h("div.field", h("span.label", "Group by"), segmented([["agent", "Agent"], ["mandate", "Mandate"], ["model", "Model"]], by,
         (v) => setQuery(q, { by: v === "agent" ? "" : v }), "Group by"))),
     table([
-      { label: titleCase(by), render: (r) => (href ? h("a.mono", { href: href(r.key) }, r.key) : h("span.mono", r.key)) },
+      { label: titleCase(by), render: (r) => (href ? h("a.mono.link", { href: href(r.key) }, r.key) : h("span.mono", r.key)) },
       { label: "Model calls", align: "r", render: (r) => h("span.num", int(r.requests)) },
       { label: "Input tokens", align: "r", render: (r) => h("span.num", int(r.prompt_tokens)) },
       { label: "Output tokens", align: "r", render: (r) => h("span.num", int(r.completion_tokens)) },
@@ -1023,50 +1269,61 @@ async function usageMonthly(q) {
 // ------------------------------------------------------------------ policy
 const BUILTIN_TEXT = {
   AGENT_REVOKED: "The agent is revoked", AGENT_INACTIVE: "The agent is suspended",
-  MANDATE_NOT_ASSIGNED: "The agent isn't assigned to the mandate, or the mandate doesn't exist",
-  MANDATE_INACTIVE: "The mandate is suspended", MODEL_NOT_ALLOWED: "The model isn't in the mandate's model list",
+  MANDATE_NOT_ASSIGNED: "The agent isn't on the mandate, or the mandate doesn't exist",
+  MANDATE_INACTIVE: "The mandate is suspended", MODEL_NOT_ALLOWED: "The model isn't on the mandate's list",
 };
 const FACT_TEXT = { "agent.id": "Agent", "mandate.id": "Mandate", "model.name": "Model" };
 
 async function pagePolicy() {
   const [p, agents, mandates, models] = await Promise.all([
     api("GET", "/admin/policy"), api("GET", "/admin/agents"), api("GET", "/admin/mandates"), api("GET", "/admin/models")]);
-  let draft = p.custom.map((r) => ({ ...r, when: { ...r.when } }));
+  const copy = () => p.custom.map((r) => ({ ...r, when: { ...r.when } }));
+  let draft = copy();
   const dirty = () => JSON.stringify(draft) !== JSON.stringify(p.custom);
   const seen = new Set();
   const builtin = p.builtin.filter((r) => !seen.has(r.reason) && seen.add(r.reason));
+  const nextVersion = p.history.length ? p.history[0].version + 1 : 1;
 
   const rulesHost = h("div");
-  const unsaved = h("div.unsaved.hidden");
-  const note = input({ placeholder: "What changed and why (optional)", maxlength: "300" });
-  const saveBtn = h("button.btn.primary", { type: "button" }, `Save as version ${p.history.length ? p.history[0].version + 1 : 1}`);
-  append(unsaved, h("strong", "Unsaved changes"), h("div.grow", note),
-    h("button.btn", { type: "button", onclick: () => { draft = p.custom.map((r) => ({ ...r, when: { ...r.when } })); drawRules(); } }, "Discard"), saveBtn);
-  saveBtn.addEventListener("click", () => busy(saveBtn, async () => {
-    try {
-      const res = await api("PUT", "/admin/policy", { rules: draft, note: note.value.trim() });
-      toast(`Saved. Policy ${res.version} applies to the next request.`);
-      refresh();
-    } catch (ex) { toast(ex.message, "error"); }
-  }));
+  const note = input({ placeholder: "What changed and why (optional)", maxlength: "300", "aria-label": "Change note" });
+  const saveBtn = h("button.btn.primary.sm", { type: "button" }, `Save as version ${nextVersion}`);
+  const unsaved = h("div.unsaved", { hidden: true }, h("b", "Unsaved changes"), note,
+    h("button.btn.ghost.sm", { type: "button", onclick: async () => {
+      if (!(await ask("Discard your changes?", "Your rules go back to the active version.", "Discard", true))) return;
+      draft = copy();
+      drawRules();
+    } }, "Discard"), saveBtn);
+  saveBtn.addEventListener("click", async () => {
+    if (!(await ask(`Save policy version ${nextVersion}?`, "It applies to the next request.", "Save"))) return;
+    await busy(saveBtn, async () => {
+      try {
+        const res = await api("PUT", "/admin/policy", { rules: draft, note: note.value.trim() });
+        toast(`Saved. Policy ${res.version} applies to the next request.`);
+        refresh();
+      } catch (ex) { toast(ex.message, "error"); }
+    });
+  });
 
   function drawRules() {
     rulesHost.replaceChildren(table([
       { label: "#", render: (r) => h("span.num.faint", String(draft.indexOf(r) + 1)) },
       { label: "Blocks a request when", render: (r) => h("div.chips", Object.entries(r.when).map(([k, v], i) =>
-        [i ? h("span.chip-sep", "and") : null, h("span.chip", `${FACT_TEXT[k] || k} = ${v}`)])) },
-      { label: "Reason code", render: (r) => h("span.code", r.reason) },
-      { label: "Message to the agent", render: (r) => h("span.muted", r.message) },
-      { label: "", align: "r", render: (r) => h("button.btn.ghost.icon", { type: "button", "aria-label": `Remove rule ${r.reason}`,
-        onclick: () => { draft = draft.filter((x) => x !== r); drawRules(); } }, icon("x")) },
-    ], draft, { empty: emptyState("No rules of your own yet", "Add one below, for example to stop one agent from using an expensive model.") }));
-    unsaved.classList.toggle("hidden", !dirty());
+        [i ? h("span.sep", "and") : null, h("span.chip.text", `${FACT_TEXT[k] || k} is ${v}`)])) },
+      { label: "Reason and message", render: (r) => h("div", h("span.code", r.reason), h("div.help", r.message)) },
+      { label: "", align: "r", render: (r) => h("button.btn.ghost.sm.icon", { type: "button", "aria-label": `Remove rule ${r.reason}`,
+        onclick: async () => {
+          if (!(await ask(`Remove rule ${r.reason}?`, "It comes off your draft. Nothing changes until you save a new version.", "Remove rule", true))) return;
+          draft = draft.filter((x) => x !== r);
+          drawRules();
+        } }, icon("x")) },
+    ], draft, { empty: emptyState("No rules of your own yet", "Add one below, for example to keep one agent off an expensive model.") }));
+    unsaved.hidden = !dirty();
   }
   drawRules();
 
-  const cond = (fact, options) => select([["", "Any"], ...options], "", { "aria-label": FACT_TEXT[fact] });
-  const cAgent = cond("agent.id", agents.map((a) => [a.id, `${a.name} (${a.id})`]));
-  const cMandate = cond("mandate.id", mandates.map((m) => [m.id, `${m.name} (${m.id})`]));
+  const cond = (fact, options) => select([["", `any ${FACT_TEXT[fact].toLowerCase()}`], ...options], "", { "aria-label": FACT_TEXT[fact] });
+  const cAgent = cond("agent.id", agents.map((a) => [a.id, a.name]));
+  const cMandate = cond("mandate.id", mandates.map((m) => [m.id, m.name]));
   const cModel = cond("model.name", models.map((m) => [m.model, m.model]));
   const reason = input({ class: "mono", placeholder: "NO_PRO_MODELS_FOR_TESTS", maxlength: "48" });
   reason.addEventListener("input", () => { reason.value = reason.value.toUpperCase().replace(/[^A-Z0-9_]/g, "_"); });
@@ -1076,33 +1333,33 @@ async function pagePolicy() {
     e.preventDefault();
     addErr.clear();
     const when = Object.fromEntries([["agent.id", cAgent.value], ["mandate.id", cMandate.value], ["model.name", cModel.value]].filter(([, v]) => v));
-    if (!Object.keys(when).length) return addErr.show("Pick at least one condition. A rule with no conditions would block everything.");
-    if (!/^[A-Z][A-Z0-9_]{2,47}$/.test(reason.value)) return addErr.show("The reason code needs 3–48 characters: capital letters, numbers and underscores, starting with a letter.");
+    if (!Object.keys(when).length) return addErr.show("Pick at least one condition. A rule with none would block everything.");
+    if (!/^[A-Z][A-Z0-9_]{2,47}$/.test(reason.value)) return addErr.show("The reason code needs 3–48 capital letters, numbers or underscores, starting with a letter.");
     if (p.builtin.some((r) => r.reason === reason.value)) return addErr.show("That reason code belongs to a built-in rule. Pick another.");
     draft.push({ reason: reason.value, when, message: message.value.trim() || reason.value });
     [cAgent, cMandate, cModel].forEach((s) => { s.value = ""; });
     reason.value = ""; message.value = "";
     drawRules();
-  } }, addErr,
-  h("div.row.three", field("Agent", cAgent), field("Mandate", cMandate), field("Model", cModel)),
+  } }, h("h3.subhead", "Add a rule"), addErr,
+  h("div.sentence", "Block when", cAgent, "uses", cModel, "under", cMandate),
   h("div.row", field("Reason code", reason), field("Message", message)),
   h("div.form-actions", h("button.btn", { type: "submit" }, icon("plus"), "Add rule")));
 
   return [
-    pageHead({ title: "Policy", badge: h("span.pill.info.plain", p.version),
-      sub: "Every request is checked against these rules, top to bottom. The first rule that matches blocks it; if none match, budgets are checked next." }),
+    pageHead({ title: "Policy", badge: h("span.pill.info.plain", p.version) }),
     h("div.grid-2",
       h("div.stack",
-        card({ title: "Your rules", hint: "Changes are saved as a new version and apply to the next request", flush: true,
-          body: [rulesHost, h("div.card-body", h("h3.subhead", "Add a rule"), addForm)], foot: unsaved })),
+        card({ title: "Your rules", flush: true, body: [rulesHost, h("div.card-pad", addForm)] }),
+        unsaved),
       h("div.stack",
-        card({ title: "Built-in rules", hint: "Always on, checked first. They protect the on/off switches.", flush: true,
-          body: h("div.list", builtin.map((r) => h("div.list-item", icon("lock"),
-            h("div", h("div.t", BUILTIN_TEXT[r.reason] || r.message), h("div.s.mono", r.reason)), null))) }),
+        card({ title: "Built-in rules", hint: "Always on, checked first", flush: true,
+          body: h("div.list", builtin.map((r) => h("div.li", h("span.faint", icon("lock")),
+            h("div", h("div.t", BUILTIN_TEXT[r.reason] || r.message), h("div.cs", r.reason)), null))) }),
         card({ title: "History", flush: true, body: p.history.length
-          ? h("div.list", p.history.map((v) => h("div.list-item", h("span.dot.info"),
-            h("div", h("div.t", `Version ${v.version}${v.version === p.number ? " (active)" : ""}`), h("div.s", `${v.rule_count} rule${v.rule_count === 1 ? "" : "s"}${v.note ? ` · ${v.note}` : ""}`)),
-            h("span.faint", when(v.created_at)))))
+          ? h("div.list", p.history.map((v) => h("div.li", h("span", { class: `dot ${v.version === p.number ? "ok" : ""}` }),
+            h("div", h("div.t", `Version ${v.version}`, v.version === p.number ? h("span.pill.ok.plain", { style: "margin-left:8px" }, "Active") : null),
+              h("div.s", `${v.rule_count} rule${v.rule_count === 1 ? "" : "s"}${v.note ? ` · ${v.note}` : ""}`)),
+            h("span.faint.num", when(v.created_at)))))
           : emptyState("No versions saved yet", "Only the built-in rules are active.") }))),
   ];
 }
@@ -1110,28 +1367,17 @@ async function pagePolicy() {
 // ------------------------------------------------------------------ activity
 async function pageActivity() {
   const events = await api("GET", "/admin/audit?limit=300");
-  return [
-    pageHead({ title: "Activity", sub: "Every change made in this console or the admin API. This log can't be edited or deleted by the gateway." }),
-    card({ flush: true, body: table([
-      { label: "When", render: (e) => h("span.num", when(e.at)) },
-      { label: "Change", render: (e) => h("strong", CHANGE_TEXT[e.decision] || e.decision) },
-      { label: "Agent / mandate", render: (e) => h("div.chips",
-        e.agent_id && h("a.chip", { href: `#/agents/${e.agent_id}` }, e.agent_id),
-        e.mandate_id && h("a.chip", { href: `#/mandates/${e.mandate_id}` }, e.mandate_id)) },
-      { label: "Details", render: (e) => changeDetails(e) || h("span.faint", "—") },
-    ], events, { empty: emptyState("No changes yet") }) }),
-  ];
+  return [pageHead({ title: "Activity" }), card({ flush: true, body: timeline(events) })];
 }
 
 // ------------------------------------------------------------------ settings
 async function pageSettings() {
   const [s, models, health] = await Promise.all([api("GET", "/admin/settings"), api("GET", "/admin/models"),
     fetch("/health/ready", { cache: "no-store" }).then((r) => r.json()).catch(() => ({}))]);
-  // The rate changes rarely and moves every INR budget, so it is shown as a value with an explicit
-  // Edit step (same pattern as budgets) instead of an always-live input that invites accidental edits.
+  // The rate changes rarely and moves every INR budget: a value with an explicit Edit step, not an always-live input.
   const rateBody = h("div.form");
   const rateView = () => rateBody.replaceChildren(
-    h("div.rate-line", h("span.big-number", h("strong", `₹${Number(s.usd_inr_rate).toFixed(2)}`)), h("span.muted", "per 1 US dollar"),
+    h("div.big", h("strong", `₹${Number(s.usd_inr_rate).toFixed(2)}`), h("span.muted", "per 1 US dollar"),
       h("button.btn.sm", { type: "button", onclick: rateEdit }, "Edit")),
     h("div.help", s.usd_inr_rate_updated_at ? `Last changed ${when(s.usd_inr_rate_updated_at)}. Used for every INR budget.` : "Used for every INR budget."));
   function rateEdit() {
@@ -1141,95 +1387,90 @@ async function pageSettings() {
     rateBody.replaceChildren(h("form.form", { onsubmit: async (e) => {
       e.preventDefault();
       err.clear();
+      if (!(await ask("Change the exchange rate?", `Every INR budget uses ₹${rate.value} per $1 from the next request.`, "Save rate"))) return;
       await busy(save, async () => {
         try { await api("PUT", "/admin/settings", { usd_inr_rate: rate.value }); toast("Rate saved. INR budgets use it from the next request."); refresh(); }
         catch (ex) { err.show(ex.message); }
       });
-    } }, err, h("div.input-group", h("span.addon", "₹"), rate), h("div.help", "Rupees for 1 US dollar. Applies to the next request."),
+    } }, err, h("div.affix", h("span", "₹"), rate), h("div.help", "Rupees for 1 US dollar. Applies to the next request."),
     h("div.form-actions", h("button.btn", { type: "button", onclick: rateView }, "Cancel"), save)));
     rate.focus();
   }
   rateView();
-  const dot = (ok) => h("span", { class: `pill ${ok ? "ok" : "danger"}` }, ok ? "OK" : "Down");
+  const ready = (ok, yes, no) => h("span", { class: `pill ${ok ? "ok" : "danger"}` }, ok ? yes : no);
   return [
     pageHead({ title: "Settings" }),
     h("div.grid-2",
       h("div.stack",
-        card({ title: "Exchange rate", hint: "Converts INR budgets to the USD that providers bill", body: rateBody }),
-        card({ title: "Models and prices", hint: "Prices come from LiteLLM's price list, per 1 million tokens", flush: true,
+        card({ title: "Exchange rate", body: rateBody }),
+        card({ title: "Models and prices", hint: "Per 1 million tokens", flush: true,
           body: table([
-            { label: "Model", render: (m) => h("div", h("div.mono", m.model), m.provider && h("div.cell-sub", m.provider)) },
+            { label: "Model", render: (m) => h("div", h("div.mono", m.model), m.provider && h("div.cs", m.provider)) },
             { label: "Input", align: "r", render: (m) => h("span.num", money(m.input_usd_per_1m)) },
             { label: "Output", align: "r", render: (m) => h("span.num", money(m.output_usd_per_1m)) },
             { label: "Max answer", align: "r", render: (m) => h("span.num", `${int(m.max_output_tokens)} tokens`) },
-            { label: "Used by", render: (m) => chips(m.mandates) },
-          ], models, { empty: emptyState("No models", "Add models in config/litellm.yaml.") }),
-          foot: h("div.toolbar", h("a", { href: "#/providers" }, "Add or remove keys and models on the Providers page")) })),
+            { label: "Used by", render: (m) => chips(m.mandates, { href: (x) => `#/mandates/${x}` }) },
+          ], models, { empty: emptyState("No models", "Add one on the Providers page.") }),
+          foot: h("a.link", { href: "#/providers" }, "Add or remove keys and models on Providers") })),
       h("div.stack",
         card({ title: "System", body: h("div.facts",
-          h("div.fact", h("div.k", "Database"), h("div.v", dot(health.db))),
-          h("div.fact", h("div.k", "LiteLLM"), h("div.v", dot(health.litellm))),
-          h("div.fact", h("div.k", "Prices loaded"), h("div.v", dot(health.prices))),
+          h("div.fact", h("div.k", "Database"), h("div.v", ready(health.db, "Ready", "Down"))),
+          h("div.fact", h("div.k", "LiteLLM"), h("div.v", ready(health.litellm, "Ready", "Down"))),
+          h("div.fact", h("div.k", "Prices"), h("div.v", ready(health.prices, "Loaded", "Missing"))),
           h("div.fact", h("div.k", "Budget month"), h("div.v", s.budget_timezone)),
-          h("div.fact", h("div.k", "Call records kept"), h("div.v", `${s.usage_retention_days} days`)),
+          h("div.fact", h("div.k", "Calls kept"), h("div.v", `${s.usage_retention_days} days`)),
           h("div.fact", h("div.k", "Log level"), h("div.v", s.log_level))) }),
-        card({ title: "Policy", body: [h("div", "Active version ", h("span.code", s.policy_version)), h("a", { href: "#/policy" }, "Edit rules")] }),
-        card({ title: "This session", body: [h("div.help", "You're signed in with the admin token in this browser tab only."),
-          h("div", h("button.btn", { type: "button", onclick: () => signOut() }, icon("logout"), "Sign out"))] }))),
+        card({ title: "This session", body: [h("div.help", "Signed in with the admin token, in this browser tab only."),
+          h("div", h("button.btn", { type: "button", onclick: confirmSignOut }, icon("logout"), "Sign out"))] }))),
   ];
 }
 
 // ------------------------------------------------------------------ providers (keys + models)
-// Design: keys are write-only. They are typed once, sent to LiteLLM (which encrypts them), and only a masked
-// hint ever comes back, so there is no "show key" button anywhere. Removing is blocked while something
-// depends on it (a key used by models, a model used by mandates) so nothing breaks silently.
+// Keys are write-only: typed once, sent to LiteLLM (which encrypts them); only a masked hint ever comes back, so there
+// is no "show key" button anywhere. Removing is refused while something depends on it, so nothing breaks silently.
 const MODEL_HINTS = { gemini: "gemini-2.5-flash", openai: "gpt-5-mini", anthropic: "claude-sonnet-4-5", mistral: "mistral-large-latest",
   deepseek: "deepseek-chat", openrouter: "meta-llama/llama-3.3-70b-instruct", openai_compatible: "my-model" };
 
 async function pageProviders() {
   const p = await api("GET", "/admin/providers");
   const removeKey = async (k) => {
-    if (!(await confirmDialog({ title: `Remove key ${k.name}?`, danger: true, confirm: "Remove key",
-      message: "LiteLLM deletes it. Models that used it must be removed first." }))) return;
+    if (!(await ask(`Remove key ${k.name}?`, "LiteLLM deletes it. Models that use it must be removed first.", "Remove key", true))) return;
     try { await api("DELETE", `/admin/providers/${k.name}`); toast("Key removed."); refresh(); } catch (ex) { toast(ex.message, "error"); }
   };
   const removeModel = async (m) => {
-    if (!(await confirmDialog({ title: `Remove model ${m.name}?`, danger: true, confirm: "Remove model",
-      message: "Agents can no longer use it. It must not be on any mandate." }))) return;
+    if (!(await ask(`Remove model ${m.name}?`, "Agents can no longer use it. It must not be on any mandate.", "Remove model", true))) return;
     try { await api("DELETE", `/admin/models/${encodeURIComponent(m.name)}`); toast("Model removed."); refresh(); } catch (ex) { toast(ex.message, "error"); }
   };
-  const setTier = async (k, tier) => {
+  const tierChoice = (k) => (k.tier_source === "admin" ? k.tier : "auto");
+  const setTier = async (k, tier, sel) => {
+    const message = tier === "auto" ? "The gateway goes back to detecting it from the provider's errors." : `It will be tagged ${TIER[tier][0].toLowerCase()} until you change it.`;
+    if (!(await ask(`Change the tier for ${k.name}?`, message, "Change tier"))) { sel.value = tierChoice(k); return; }
     try { await api("PUT", `/admin/providers/${k.name}/tier`, { tier }); toast(tier === "auto" ? "Back to automatic detection." : `Tagged as ${TIER[tier][0].toLowerCase()}.`); }
     catch (ex) { toast(ex.message, "error"); }
     refresh();
   };
-  const tierCell = (k) => h("div", tierPill(k.tier),
-    h("div.help", k.tier_source === "admin" ? "set by you" : k.tier_source === "detected" ? `detected ${when(k.tier_updated_at)}` : "waits for a provider signal"),
-    select([["auto", "Detect automatically"], ["free", "Set: free tier"], ["paid", "Set: paid"]], k.tier_source === "admin" ? k.tier : "auto",
-      { class: "select tier-select", "aria-label": `Tier for ${k.name}`, onchange: (e) => setTier(k, e.target.value) }));
+  const tierCell = (k) => h("div", { style: "display:grid;gap:4px;justify-items:start" }, tierPill(k.tier),
+    select([["auto", k.tier_source === "detected" ? `Detected ${when(k.tier_updated_at)}` : "Detect automatically"], ["free", "Set: free tier"], ["paid", "Set: paid"]], tierChoice(k),
+      { class: "select sm", "aria-label": `Tier for ${k.name}`, onchange: (e) => setTier(k, e.target.value, e.target) }));
   return [
-    pageHead({ title: "Providers", sub: "Your AI company keys and the models agents may use.",
+    pageHead({ title: "Providers",
       actions: [h("button.btn", { type: "button", onclick: () => openAddModel(p) }, icon("plus"), "Add model"),
         h("button.btn.primary", { type: "button", onclick: () => openAddKey(p) }, icon("plus"), "Add key")] }),
-    callout("", h("strong", "How keys are kept safe. "), "A key is sent once to LiteLLM, which encrypts it (AES-256-GCM) with a secret that exists only in the .env file. " +
-      "It is never stored in the gateway's database, never logged, and can't be shown again, not even here. Only a few characters are shown (like sk****ar) so you can tell keys apart."),
-    card({ title: "Keys", hint: "Free or paid: no AI company reports this for a key, so the gateway tags a key as free tier when the provider's own rate-limit error says so. Set it yourself to override.", flush: true, body:
-      table([
-        { label: "Name", render: (k) => h("div", h("span.cell-title", k.name), k.source === "env" && h("div.help", "from the .env file")) },
-        { label: "Provider", render: (k) => h("div", k.label, k.api_base && h("div.cell-sub", k.api_base)) },
-        { label: "Key", render: (k) => (k.key_hint ? h("span.code", k.key_hint) : h("span.faint", "in .env")) },
-        { label: "Tier", render: tierCell },
-        { label: "Models", render: (k) => chips(k.models) },
-        { label: "", align: "r", render: (k) => (k.source === "console"
-          ? h("button.btn.sm.danger", { type: "button", onclick: () => removeKey(k) }, "Remove") : h("span.faint", "In files")) },
-      ], p.keys, { empty: emptyState("No keys yet", "Add a key, then add the models it unlocks.",
-        h("button.btn.primary", { type: "button", onclick: () => openAddKey(p) }, icon("plus"), "Add key")) }) }),
-    card({ title: "Models", hint: "Agents can only use a model once it's on one of their mandates", flush: true, body: table([
-      { label: "Model name", render: (m) => h("div", h("div.mono", m.name), h("div.cell-sub", m.provider_model)) },
+    card({ title: "Keys", hint: "Encrypted by LiteLLM; only a masked hint is ever shown", flush: true, body: table([
+      { label: "Name", render: (k) => h("div", h("span.ct", k.name), h("div.cs", k.source === "env" ? "from .env" : "added here")) },
+      { label: "Provider", render: (k) => h("div", k.label, k.api_base && h("div.cs", k.api_base)) },
+      { label: "Key", render: (k) => (k.key_hint ? h("span.code", k.key_hint) : h("span.faint", "in .env")) },
+      { label: "Tier", title: "No AI company reports free or paid for a key. The gateway tags a key as free tier when the provider's own rate-limit error says so; you can override it.", render: tierCell },
+      { label: "Models", render: (k) => chips(k.models) },
+      { label: "", align: "r", render: (k) => (k.source === "console"
+        ? h("button.btn.sm.danger", { type: "button", onclick: () => removeKey(k) }, "Remove") : h("span.faint", "In files")) },
+    ], p.keys, { empty: emptyState("No keys yet", "Add a key, then add the models it unlocks.") }) }),
+    card({ title: "Models", flush: true, body: table([
+      { label: "Model", render: (m) => h("div", h("div.mono", m.name), h("div.cs", m.provider_model)) },
       { label: "Key", render: (m) => (m.source === "config" ? h("span.pill.plain", "config file") : h("span.chip", m.provider_key)) },
       { label: "Tier", render: (m) => tierPill(m.tier) },
-      { label: "Price per 1M tokens", render: (m) => (m.priced ? h("span.num", `${money(m.input_usd_per_1m)} in · ${money(m.output_usd_per_1m)} out`) : h("span.pill.warn.plain", "No price")) },
-      { label: "Used by", render: (m) => chips(m.mandates) },
+      { label: "Per 1M tokens", align: "r", render: (m) => (m.priced ? h("span.num", `${money(m.input_usd_per_1m)} in · ${money(m.output_usd_per_1m)} out`) : h("span.pill.warn.plain", "No price")) },
+      { label: "Used by", render: (m) => chips(m.mandates, { href: (x) => `#/mandates/${x}` }) },
       { label: "", align: "r", render: (m) => (m.source === "console"
         ? h("button.btn.sm.danger", { type: "button", onclick: () => removeModel(m) }, "Remove")
         : h("span.faint", { title: "Defined in config/litellm.yaml" }, "In files")) },
@@ -1238,7 +1479,7 @@ async function pageProviders() {
 }
 
 function openAddKey(p) {
-  const m = modal({ title: "Add a provider key", sub: "Paste the key from the AI company's website. You won't be able to see it again after saving." });
+  const m = modal({ title: "Add a provider key", sub: "Paste the key from the AI company's website. You can't see it again after saving." });
   const provider = select(p.provider_choices.map((c) => [c.id, c.label]), "gemini");
   const name = input({ class: "mono", value: "gemini-main", maxlength: "64" });
   let nameEdited = false;
@@ -1247,13 +1488,13 @@ function openAddKey(p) {
   const base = input({ class: "mono", placeholder: "https://my-server.example.com/v1" });
   const baseField = field("Base URL", base, "Only for OpenAI-compatible servers (self-hosted or other companies).");
   const sync = () => {
-    baseField.classList.toggle("hidden", provider.value !== "openai_compatible");
+    baseField.hidden = provider.value !== "openai_compatible";
     if (!nameEdited) name.value = `${provider.value.replace("_", "-")}-main`;
   };
   provider.addEventListener("change", sync);
   sync();
   const err = formError();
-  const submit = h("button.btn.primary", { type: "submit", form: "add-key" }, "Save key");
+  const submit = h("button.btn.primary", { type: "submit", form: "add-key" }, icon("lock"), "Save key");
   append(m.body, h("form.form", { id: "add-key", onsubmit: async (e) => {
     e.preventDefault();
     err.clear();
@@ -1311,11 +1552,12 @@ function openAddModel(p) {
   } }, err, field("Key", key), h("div.row", field("Model ID at the provider", pm, "Exactly as the provider names it."),
     field("Name in the gateway", name, "What agents and mandates use.")),
   h("div.field", h("span.label", "Price per 1 million tokens (USD, optional)"),
-    h("div.row", h("div.input-group", h("span.addon", "In $"), pin), h("div.input-group", h("span.addon", "Out $"), pout)),
-    h("div.help", "Leave empty to use LiteLLM's price list. Needed only for models LiteLLM doesn't know; without a price the gateway can't budget the model."))));
+    h("div.row", h("div.affix", h("span", "In $"), pin), h("div.affix", h("span", "Out $"), pout)),
+    h("div.help", "Leave empty to use LiteLLM's price list. Without a price the gateway can't budget the model."))));
   append(m.foot, h("button.btn", { type: "button", onclick: m.close }, "Cancel"), submit);
 }
 
 // ------------------------------------------------------------------ boot
 window.addEventListener("hashchange", () => render());
+window.addEventListener("resize", moveIndicator);
 render();

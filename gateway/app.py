@@ -547,7 +547,9 @@ async def put_policy(body: PolicyUpdate):
 
 @admin.get("/settings")
 async def get_settings():
+    period = await state.pool.fetchrow("SELECT budget_period() AS month, (budget_period() + interval '1 month')::date AS resets_on")
     return {"usd_inr_rate": str(state.inr_rate), "usd_inr_rate_updated_at": state.inr_rate_updated,
+            "budget_month": period["month"].strftime("%Y-%m"), "budget_resets_on": period["resets_on"].isoformat(),
             "budget_timezone": BUDGET_TIMEZONE, "usage_retention_days": USAGE_RETENTION_DAYS,
             "policy_version": state.policy.version, "log_level": LOG_LEVEL}
 
@@ -798,9 +800,14 @@ app.include_router(admin)
 
 # Admin UI: static files only; they hold no data and call the admin API above with the admin token.
 UI_DIR = os.path.join(os.path.dirname(__file__), "ui")
-UI_FILES = {"": "index.html", "app.js": "app.js", "app.css": "app.css"}
+UI_FILES = {"": "index.html", "app.js": "app.js", "app.css": "app.css", "fx.js": "fx.js",
+            "geist.woff2": "geist.woff2", "geist-mono.woff2": "geist-mono.woff2"}
+UI_TYPES = {".woff2": "font/woff2", ".js": "text/javascript"}
+# fx.js (vendored metal-fx button effect) injects fixed <style> blocks; only those exact blocks are allowed, by hash.
+with open(os.path.join(UI_DIR, "fx.csp")) as f:
+    UI_STYLE_HASHES = f.read().strip()
 UI_HEADERS = {
-    "Content-Security-Policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; "
+    "Content-Security-Policy": f"default-src 'self'; script-src 'self'; style-src 'self' {UI_STYLE_HASHES}; img-src 'self' data:; "
                                "frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
     "X-Frame-Options": "DENY", "X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer",
     "Cache-Control": "no-store"}
@@ -813,7 +820,8 @@ async def ui_index():
 async def ui_asset(asset: str):
     if asset not in UI_FILES or not asset:
         raise GatewayError(404, "NOT_FOUND", "not found")
-    return FileResponse(os.path.join(UI_DIR, UI_FILES[asset]), headers=UI_HEADERS)
+    return FileResponse(os.path.join(UI_DIR, UI_FILES[asset]), headers=UI_HEADERS,
+                        media_type=UI_TYPES.get(os.path.splitext(asset)[1]))
 
 
 # ---------------------------------------------------------------------------- cost estimate

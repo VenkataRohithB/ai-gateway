@@ -397,6 +397,13 @@ async def test_inr_budget_uses_the_admin_exchange_rate(client, upstream, owner):
     assert await owner.fetchval("SELECT count(*) FROM audit_events WHERE decision='settings_updated'") == 1
 
 
+async def test_settings_give_budget_month_and_reset_date(client):
+    s = await admin(client, "GET", "/admin/settings", expect=200)
+    period = await gw.state.pool.fetchval("SELECT budget_period()")  # India-time month the budgets count in
+    y, m = (period.year + 1, 1) if period.month == 12 else (period.year, period.month + 1)
+    assert s["budget_month"] == period.strftime("%Y-%m") and s["budget_resets_on"] == f"{y:04d}-{m:02d}-01"
+
+
 async def test_concurrent_requests_cannot_overspend(client, upstream, owner):
     """50 simultaneous requests while the upstream is held: only floor(limit/estimate) may be reserved."""
     est = estimate()
@@ -681,11 +688,18 @@ async def test_every_admin_route_requires_admin_token(client):
 
 
 async def test_admin_ui_is_static_and_locked_down(client):
-    for path in ("/admin/ui", "/admin/ui/app.js", "/admin/ui/app.css"):
+    types = {"/admin/ui/fx.js": "text/javascript", "/admin/ui/geist.woff2": "font/woff2", "/admin/ui/geist-mono.woff2": "font/woff2"}
+    for path in ("/admin/ui", "/admin/ui/app.js", "/admin/ui/app.css", *types):
         r = await client.get(path)
-        assert r.status_code == 200 and "unsafe-inline" not in r.headers["content-security-policy"]
+        csp = r.headers["content-security-policy"]
+        assert r.status_code == 200 and "unsafe-inline" not in csp and "script-src 'self';" in csp
+        # styles: own files plus only the hashed <style> blocks the vendored button effect injects
+        style_src = next(d for d in csp.split(";") if d.strip().startswith("style-src")).split()[1:]
+        assert style_src[0] == "'self'" and len(style_src) > 1 and all(s.startswith("'sha256-") for s in style_src[1:])
         assert r.headers["x-frame-options"] == "DENY"
-    for path in ("/admin/ui/../app.py", "/admin/ui/index.html.bak", "/admin/ui/app.py"):
+        if path in types:
+            assert r.headers["content-type"].startswith(types[path])
+    for path in ("/admin/ui/../app.py", "/admin/ui/index.html.bak", "/admin/ui/app.py", "/admin/ui/fx.csp", "/admin/ui/THIRD_PARTY.txt"):
         assert (await client.get(path)).status_code == 404
 
 

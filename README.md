@@ -7,7 +7,7 @@ model provider. Everything is managed from an admin console, and any agent can b
 
 First product: SynBioAI (5 agents). First real client: ResearchOS. Plans and design record: `docs/plan/`.
 
-**Status:** v3 MVP. 93 automated tests plus an end-to-end proof through the real LiteLLM, all passing,
+**Status:** v3 MVP. 120 automated tests plus an end-to-end proof through the real LiteLLM, all passing,
 all against a fake model at **no cost**.
 
 ```
@@ -151,7 +151,7 @@ Error bodies have the shape `{"error": {"code", "message", "request_id", …}}` 
 
 ## 4. Policy
 
-Every request is checked against an ordered list of deny rules; the first match blocks it.
+Every request is checked against an ordered list of deny rules; a match blocks it.
 
 - **Built-in rules** (always on, checked first): agent revoked, agent suspended, not assigned to the mandate (unknown
   mandates look the same), mandate suspended, model not in the mandate's list. The budget transaction re-checks the
@@ -160,6 +160,10 @@ Every request is checked against an ordered list of deny rules; the first match 
   **model** matches, with your own reason code and message. Saving creates a new numbered version (`v3-1a2b3c4d`),
   recorded on every usage row and in Activity. It applies to the next request; no restart.
 - Rules are validated on save: unknown conditions, empty conditions or a built-in reason code are refused.
+- **Evaluated by [Cedar](https://www.cedarpolicy.com/)** (`cedarpy`). Each rule becomes a `forbid` with `@id("<REASON>")`,
+  plus one `permit`, checked against a Cedar schema. Rules are still stored as JSON; the generated Cedar is shown
+  read-only on the Policy page and in `GET /admin/policy` (`cedar`). When several rules match, the first in the list
+  wins. Any Cedar error blocks the request (`POLICY_ERROR`), never allows it.
 
 ## 5. Budgets
 
@@ -226,14 +230,15 @@ A request already forwarded finishes and is charged; it is not cancelled. State 
 ## 9. Tests (free: no real model calls)
 
 ```bash
-scripts/test.sh          # 93 pytest tests + end-to-end proof
+scripts/test.sh          # 120 pytest tests + end-to-end proof
 scripts/test.sh unit     # pytest only
 ```
 
 Everything runs in a separate Compose project, `aigw-test`, with its own database. LiteLLM is pointed at
 `tests/mock_upstream.py`, a fake model that counts every call (and can be told to answer "busy").
 
-- **`tests/test_policy.py`:** built-in rules, custom rules, validation, version hashing, agreement with the SQL guard.
+- **`tests/test_policy.py`:** built-in rules, custom rules, validation, version hashing, agreement with the SQL guard,
+  Cedar compilation, rule priority, fail-closed errors.
 - **`tests/test_gateway.py`:** real Postgres with a counting mock in place of LiteLLM: auth, impersonation, every kill
   switch (proving the upstream count does not move), monthly rollover, INR budgets and rate changes, 50-way
   concurrency, exact rate limits, every fallback path, the worst-case estimate on real Claude/GPT/Gemini price shapes,

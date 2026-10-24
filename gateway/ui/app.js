@@ -1361,6 +1361,8 @@ async function pagePolicy() {
               h("div.s", `${v.rule_count} rule${v.rule_count === 1 ? "" : "s"}${v.note ? ` · ${v.note}` : ""}`)),
             h("span.faint.num", when(v.created_at)))))
           : emptyState("No versions saved yet", "Only the built-in rules are active.") }))),
+    card({ title: "Cedar policy", hint: `What the gateway evaluates for ${p.version}. Generated from the rules above, read-only.`,
+      body: h("pre.cedar", { tabindex: "0", "aria-label": "Cedar policy text" }, p.cedar) }),
   ];
 }
 

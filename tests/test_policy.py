@@ -1,8 +1,10 @@
 """Unit tests for gateway/policy.py. No database, no network."""
-import itertools
+import itertools, re
 
+import cedarpy
 import pytest
 
+import policy as policy_module
 from policy import BUILTIN, FACTS, Policy
 
 OK = {"agent.status": "active", "assignment.exists": True, "mandate.status": "active", "model.allowed": True,
@@ -84,3 +86,91 @@ def test_version_tracks_rule_content():
 
 def test_builtin_rules_only_use_known_facts():
     assert {k for r in BUILTIN for k in r["when"]} <= FACTS
+
+
+# --------------------------------------------------------------------------- Cedar evaluator
+@pytest.mark.parametrize("rule", BUILTIN, ids=lambda r: f"{r['reason']}-{next(iter(r['when']))}")
+def test_each_builtin_rule_is_a_cedar_forbid_that_denies(policy, rule):
+    assert f'@id("{rule["reason"]}")\nforbid' in policy.cedar
+    d = policy.evaluate({**OK, **rule["when"]})
+    assert d == {"allow": False, "reason": rule["reason"], "message": rule["message"], "policy_version": policy.version}
+
+
+def test_generated_cedar_validates_against_the_schema(policy):
+    assert cedarpy.validate_policies(policy.cedar, policy_module.SCHEMA).validation_passed
+    assert policy.cedar.count("forbid") == len(BUILTIN) and policy.cedar.count("permit") == 1
+    assert re.fullmatch(r"v0-[0-9a-f]{8}", policy.version)
+
+
+def test_custom_rule_compiles_to_cedar_and_denies():
+    odd = 'agent "x"\\y\n\x01é'  # quotes, backslash, control chars and non-ASCII must not break out of the literal
+    p = Policy([{"reason": "NO_M2_FOR_A", "when": {"model.name": "mock-model-2", "agent.id": "agent-a", "mandate.id": "m1"},
+                 "message": "no"}, {"reason": "ODD_AGENT", "when": {"agent.id": odd}}], 7)
+    assert ('@id("NO_M2_FOR_A")\nforbid (principal, action == Action::"call", resource)\n'
+            'when { principal == Agent::"agent-a" && context.mandate.id == "m1" && resource == Model::"mock-model-2" };') in p.cedar
+    assert p.evaluate({**OK, "model.name": "mock-model-2"}) == {"allow": False, "reason": "NO_M2_FOR_A", "message": "no",
+                                                                  "policy_version": p.version}
+    assert p.evaluate({**OK, "model.name": "mock-model-2", "mandate.id": "m2"})["allow"]
+    assert p.evaluate({**OK, "agent.id": odd})["reason"] == "ODD_AGENT"
+    assert p.evaluate({**OK, "agent.id": 'agent "x"'})["allow"]
+    assert p.custom == Policy(p.custom, 7).custom and p.version == Policy(p.custom, 7).version  # stored JSON round-trips
+
+
+def test_when_several_rules_match_the_first_in_list_order_wins():
+    p = Policy([{"reason": "FIRST_RULE", "when": {"model.name": "mock-model"}},
+                {"reason": "SECOND_RULE", "when": {"agent.id": "agent-a", "model.name": "mock-model"}}])
+    assert p.evaluate(OK)["reason"] == "FIRST_RULE"
+    assert Policy(list(reversed(p.custom))).evaluate(OK)["reason"] == "SECOND_RULE"
+    everything = {**OK, "agent.status": "suspended", "assignment.exists": False, "mandate.status": "suspended", "model.allowed": False}
+    assert p.evaluate(everything)["reason"] == "AGENT_INACTIVE"
+    assert p.evaluate({**everything, "agent.status": "active"})["reason"] == "MANDATE_NOT_ASSIGNED"
+    assert p.evaluate({**OK, "mandate.status": "suspended", "model.allowed": False})["reason"] == "MANDATE_INACTIVE"
+    assert p.evaluate({**OK, "model.allowed": False})["reason"] == "MODEL_NOT_ALLOWED"
+
+
+@pytest.mark.parametrize("facts", [
+    {**OK, "assignment.exists": "yes"},       # wrong type for the schema
+    {**OK, "assignment.exists": None},
+    {**OK, "agent.status": 1},
+    {k: v for k, v in OK.items() if k != "model.allowed"},  # missing fact
+])
+def test_bad_facts_fail_closed(policy, facts):
+    d = policy.evaluate(facts)
+    assert d["allow"] is False and d["reason"] == "POLICY_ERROR" and d["policy_version"] == policy.version
+
+
+def test_evaluator_error_fails_closed(policy, monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("cedar exploded")
+    monkeypatch.setattr(cedarpy, "is_authorized", boom)
+    assert policy.evaluate(OK) == {"allow": False, "reason": "POLICY_ERROR", "message": policy_module.EVAL_ERROR["message"],
+                                   "policy_version": policy.version}
+
+
+@pytest.mark.parametrize("allowed, reasons, errors", [
+    (True, ["policy6"], ["a forbid failed to evaluate"]),  # Cedar skips an erroring forbid; we must not allow
+    (False, [], []),                                        # deny with no matching rule
+])
+def test_cedar_errors_and_unexplained_denies_fail_closed(policy, monkeypatch, allowed, reasons, errors):
+    diagnostics = type("Diagnostics", (), {"reasons": reasons, "errors": errors})()
+    result = type("AuthzResult", (), {"allowed": allowed, "decision": "?", "diagnostics": diagnostics})()
+    monkeypatch.setattr(cedarpy, "is_authorized", lambda *a, **k: result)
+    assert policy.evaluate(OK)["reason"] == "POLICY_ERROR"
+
+
+def test_policy_error_reason_is_reserved():
+    with pytest.raises(ValueError, match="built-in"):
+        Policy([{"reason": "POLICY_ERROR", "when": {"agent.id": "a"}}])
+
+
+@pytest.mark.parametrize("status, reason", [("revoked", "AGENT_REVOKED"), ("suspended", "AGENT_INACTIVE")])
+def test_stopped_agent_is_denied_for_every_combination_of_other_facts(status, reason):
+    policies = [Policy(), Policy([{"reason": "BLOCK_M1", "when": {"mandate.id": "m1"}},
+                                  {"reason": "BLOCK_A_M2", "when": {"agent.id": "agent-a", "model.name": "mock-model-2"}}], 4)]
+    for p, assigned, mandate, allowed, agent, mandate_id, model in itertools.product(
+            policies, [True, False], ["active", "suspended", "unknown"], [True, False],
+            ["agent-a", "agent-b", 'q"uote'], ["m1", "m2", ""], ["mock-model", "mock-model-2", "x"]):
+        facts = {"agent.status": status, "assignment.exists": assigned, "mandate.status": mandate, "model.allowed": allowed,
+                 "agent.id": agent, "mandate.id": mandate_id, "model.name": model}
+        d = p.evaluate(facts)
+        assert d["allow"] is False and d["reason"] == reason, facts

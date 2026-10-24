@@ -225,6 +225,13 @@ async def test_custom_policy_rule_from_admin_api(client, upstream, owner):
     assert await owner.fetchval("SELECT count(*) FROM audit_events WHERE decision='policy_updated'") == 1
 
 
+async def test_admin_policy_shows_the_generated_cedar(client):
+    rule = {"reason": "NO_A", "when": {"agent.id": "agent-a"}}
+    p = await admin(client, "PUT", "/admin/policy", {"rules": [rule]}, 200)
+    assert '@id("NO_A")\nforbid' in p["cedar"] and '@id("AGENT_REVOKED")' in p["cedar"] and p["cedar"].count("permit") == 1
+    assert (await admin(client, "GET", "/admin/policy"))["cedar"] == p["cedar"]
+
+
 async def test_policy_version_survives_restart(upstream, owner):
     gw.UPSTREAM_TRANSPORT = httpx.MockTransport(upstream.handler)
     rule = {"reason": "BLOCK_ALL_M1", "when": {"mandate.id": "m1"}}

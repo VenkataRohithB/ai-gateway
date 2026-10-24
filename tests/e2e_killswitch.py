@@ -16,10 +16,11 @@ Proves, for two agents A and B sharing one mandate:
   9. provider key + model added from the console API work end to end; the raw key is in no database
  10. deployment checks: LiteLLM/Postgres not published, no secrets tracked in git, gateway holds no provider secrets
 """
-import json, os, pathlib, subprocess, sys, time, urllib.error, urllib.request
+import json, os, pathlib, shutil, subprocess, sys, time, urllib.error, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENV = {**os.environ, "COMPOSE_PROJECT_NAME": "aigw-test", "COMPOSE_FILE": "docker-compose.yml:docker-compose.test.yml",
+       "COMPOSE_PATH_SEPARATOR": ":",
        "GATEWAY_PORT": os.environ.get("GATEWAY_PORT", "18080"), "MOCK_PORT": os.environ.get("MOCK_PORT", "19000")}
 GW = f"http://127.0.0.1:{ENV['GATEWAY_PORT']}"
 MOCK = f"http://127.0.0.1:{ENV['MOCK_PORT']}"
@@ -39,7 +40,7 @@ ADMIN_TOKEN = dotenv("ADMIN_TOKEN")
 
 
 def sh(*args: str, check=True) -> str:
-    return subprocess.run(args, cwd=ROOT, env=ENV, check=check, capture_output=True, text=True).stdout
+    return subprocess.run(args, cwd=ROOT, env=ENV, check=check, capture_output=True, text=True, encoding="utf-8", errors="replace").stdout
 
 
 def http(method: str, url: str, body=None, token=None) -> tuple[int, dict]:
@@ -101,7 +102,7 @@ def usage(agent: str | None = None, outcome: str | None = None) -> list[dict]:
 def main() -> int:
     print("== starting isolated test stack (aigw-test)")
     sh("docker", "compose", "up", "-d", "--build", "db", "litellm", "mock-upstream", "migrate", "gateway")
-    sh(str(ROOT / "scripts/litellm-setup.sh"))
+    sh(shutil.which("bash") or "bash", "scripts/litellm-setup.sh")  # Windows: PATH bash (Git Bash), not System32 WSL bash
     wait_ready()
     http("POST", MOCK + "/reset")
     key_spend_before = key_spend()

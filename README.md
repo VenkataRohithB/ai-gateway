@@ -43,6 +43,9 @@ curl -s 127.0.0.1:8080/health/ready   # {"db":true,"litellm":true,"prices":true}
 
 Open the console at **http://127.0.0.1:8080/admin/ui** and sign in with `ADMIN_TOKEN` from `.env`.
 
+**Windows:** use Git Bash; `.gitattributes` keeps scripts LF. Prefix admin CLI calls with `MSYS_NO_PATHCONV=1` (so
+`/admin/...` isn't rewritten to a Windows path) and run the e2e with `PYTHONIOENCODING=utf-8`.
+
 **Stop or restart:** `docker compose stop` / `docker compose up -d`. All state lives in the volume `ai-agent-gateway_pgdata`.
 `docker compose down -v` **deletes everything**. Database changes are applied automatically by the `migrate` service.
 

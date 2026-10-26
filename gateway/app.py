@@ -526,7 +526,8 @@ async def get_policy():
     history = await state.pool.fetch(
         "SELECT version, note, created_at, jsonb_array_length(rules) AS rule_count FROM policy_versions ORDER BY version DESC LIMIT 50")
     return {"version": state.policy.version, "number": state.policy.number, "builtin": BUILTIN,
-            "custom": state.policy.custom, "custom_facts": sorted(CUSTOM_FACTS), "history": [dict(r) for r in history]}
+            "custom": state.policy.custom, "custom_facts": sorted(CUSTOM_FACTS), "cedar": state.policy.cedar,
+            "history": [dict(r) for r in history]}
 
 @admin.put("/policy")
 async def put_policy(body: PolicyUpdate):

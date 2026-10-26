@@ -4,6 +4,8 @@ uvicorn==0.53.0
 httpx==0.28.1
 asyncpg==0.31.0
 cedarpy==4.12.1
+PyJWT==2.15.1          # tool-server passes (RS256)
+cryptography==50.0.2
 # Transitive, frozen 2026-10-12 (pip freeze on python:3.13-slim)
 annotated-doc==0.0.5
 annotated-types==0.8.0
@@ -18,3 +20,5 @@ pydantic_core==2.50.1
 starlette==1.7.0
 typing-inspection==0.4.4
 typing_extensions==4.16.0
+cffi==2.1.1            # for cryptography, frozen 2026-10-26
+pycparser==3.11

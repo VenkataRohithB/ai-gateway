@@ -62,7 +62,7 @@ async def upstream():
 @pytest.fixture
 async def owner():
     conn = await asyncpg.connect(OWNER_DSN)
-    await conn.execute("TRUNCATE audit_events, reservations, agent_mandates, agents, mandates, usage, usage_monthly, policy_versions, provider_tiers, auth_failures RESTART IDENTITY")
+    await conn.execute("TRUNCATE audit_events, reservations, agent_mandates, mandate_tool_servers, tool_servers, agents, mandates, usage, usage_monthly, policy_versions, provider_tiers, auth_failures RESTART IDENTITY")
     await conn.execute("UPDATE settings SET value='85' WHERE key='usd_inr_rate'")
     yield conn
     await conn.close()
@@ -686,7 +686,8 @@ async def test_every_admin_route_requires_admin_token(client):
     routes = [(m, r.path) for r in gw.admin.routes if isinstance(r, APIRoute) for m in r.methods]
     assert len(routes) >= 20 and all(p.startswith("/admin/") for _, p in routes)
     public = {r.path for r in gw.app.routes if isinstance(r, APIRoute)}
-    assert public <= {"/health/live", "/health/ready", "/m/{mandate_id}/v1/chat/completions", "/admin/ui", "/admin/ui/{asset}"}, public
+    assert public <= {"/health/live", "/health/ready", "/m/{mandate_id}/v1/chat/completions", "/m/{mandate_id}/mcp/{server_id}",
+                      "/.well-known/openid-configuration", "/.well-known/jwks.json", "/admin/ui", "/admin/ui/{asset}"}, public
     for method, path in routes:
         url = path.replace("{agent_id}", "a").replace("{mandate_id}", "m")
         for headers in ({}, {"Authorization": "Bearer wrong"}, {"Authorization": "Bearer gw_agenttoken"}):

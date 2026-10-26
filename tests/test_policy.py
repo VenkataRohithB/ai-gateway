@@ -5,7 +5,7 @@ import cedarpy
 import pytest
 
 import policy as policy_module
-from policy import BUILTIN, FACTS, Policy
+from policy import BUILTIN, FACTS, TOOL_BUILTIN, Policy
 
 OK = {"agent.status": "active", "assignment.exists": True, "mandate.status": "active", "model.allowed": True,
       "agent.id": "agent-a", "mandate.id": "m1", "model.name": "mock-model"}
@@ -98,7 +98,7 @@ def test_each_builtin_rule_is_a_cedar_forbid_that_denies(policy, rule):
 
 def test_generated_cedar_validates_against_the_schema(policy):
     assert cedarpy.validate_policies(policy.cedar, policy_module.SCHEMA).validation_passed
-    assert policy.cedar.count("forbid") == len(BUILTIN) and policy.cedar.count("permit") == 1
+    assert policy.cedar.count("forbid") == len(BUILTIN + TOOL_BUILTIN) and policy.cedar.count("permit") == 1
     assert re.fullmatch(r"v0-[0-9a-f]{8}", policy.version)
 
 
@@ -174,3 +174,48 @@ def test_stopped_agent_is_denied_for_every_combination_of_other_facts(status, re
                  "agent.id": agent, "mandate.id": mandate_id, "model.name": model}
         d = p.evaluate(facts)
         assert d["allow"] is False and d["reason"] == reason, facts
+
+
+# --------------------------------------------------------------------------- tool calls (call_tool action)
+TOOL = {"agent.status": "active", "assignment.exists": True, "mandate.status": "active", "server.allowed": True,
+        "tool.allowed": True, "agent.id": "agent-a", "mandate.id": "m1", "tool.server": "fetch"}
+
+
+@pytest.mark.parametrize("change, reason", [
+    ({"agent.status": "suspended"}, "AGENT_INACTIVE"), ({"agent.status": "revoked"}, "AGENT_REVOKED"),
+    ({"assignment.exists": False}, "MANDATE_NOT_ASSIGNED"), ({"mandate.status": "suspended"}, "MANDATE_INACTIVE"),
+    ({"server.allowed": False}, "TOOL_SERVER_NOT_ALLOWED"), ({"tool.allowed": False}, "MCP_TOOL_NOT_ALLOWED"),
+])
+def test_tool_calls_meet_the_same_kill_switches(policy, change, reason):
+    assert policy.evaluate(TOOL)["allow"]
+    assert policy.evaluate({**TOOL, **change})["reason"] == reason
+
+
+def test_rules_apply_to_the_action_their_facts_belong_to():
+    p = Policy([{"reason": "NO_M2_MODEL", "when": {"model.name": "mock-model-2"}},
+                {"reason": "NO_FETCH_FOR_A", "when": {"agent.id": "agent-a", "tool.server": "fetch"}},
+                {"reason": "BLOCK_B", "when": {"agent.id": "agent-b"}}])
+    assert '@id("NO_FETCH_FOR_A")\nforbid (principal, action == Action::"call_tool", resource)' in p.cedar
+    assert '@id("BLOCK_B")\nforbid (principal, action in [Action::"call", Action::"call_tool"], resource)' in p.cedar
+    assert p.evaluate({**TOOL, "tool.server": "fetch"})["reason"] == "NO_FETCH_FOR_A"
+    assert p.evaluate({**TOOL, "tool.server": "time"})["allow"]
+    assert p.evaluate({**OK, "model.name": "mock-model-2"})["reason"] == "NO_M2_MODEL"
+    assert p.evaluate(OK)["allow"]                                   # a tool-server rule never touches model calls
+    assert p.evaluate({**TOOL, "agent.id": "agent-b"})["reason"] == p.evaluate({**OK, "agent.id": "agent-b"})["reason"] == "BLOCK_B"
+    with pytest.raises(ValueError, match="not both"):
+        Policy([{"reason": "NEVER", "when": {"model.name": "x", "tool.server": "y"}}])
+
+
+@pytest.mark.parametrize("status, reason", [("revoked", "AGENT_REVOKED"), ("suspended", "AGENT_INACTIVE")])
+def test_stopped_agent_is_denied_every_tool_call(status, reason):
+    p = Policy([{"reason": "BLOCK_FETCH", "when": {"tool.server": "fetch"}}], 2)
+    for assigned, mandate, server_ok, tool_ok, server in itertools.product(
+            [True, False], ["active", "suspended", "unknown"], [True, False], [True, False], ["fetch", "time", 'q"x']):
+        facts = {**TOOL, "agent.status": status, "assignment.exists": assigned, "mandate.status": mandate,
+                 "server.allowed": server_ok, "tool.allowed": tool_ok, "tool.server": server}
+        assert p.evaluate(facts) == {"allow": False, "reason": reason, "message": p.evaluate(facts)["message"],
+                                     "policy_version": p.version}, facts
+
+
+def test_tool_facts_missing_fail_closed(policy):
+    assert policy.evaluate({k: v for k, v in TOOL.items() if k != "tool.allowed"})["reason"] == "POLICY_ERROR"

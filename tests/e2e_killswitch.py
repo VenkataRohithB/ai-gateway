@@ -14,9 +14,11 @@ Proves, for two agents A and B sharing one mandate:
   7. restoring A lets A work again
   8. a busy model (429) falls back to the next model in the mandate's list, through the real LiteLLM
   9. provider key + model added from the console API work end to end; the raw key is in no database
- 10. deployment checks: LiteLLM/Postgres not published, no secrets tracked in git, gateway holds no provider secrets
+ 10. MCP tool calls go through the same gate: only allowed servers/tools are reached, with a signed pass instead of
+     the agent token; suspending the agent mid-task closes its open tool stream and blocks its next model AND tool call
+ 11. deployment checks: LiteLLM/Postgres not published, no secrets tracked in git, gateway holds no provider secrets
 """
-import json, os, pathlib, shutil, subprocess, sys, time, urllib.error, urllib.request
+import base64, json, os, pathlib, shutil, subprocess, sys, threading, time, urllib.error, urllib.request
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 ENV = {**os.environ, "COMPOSE_PROJECT_NAME": "aigw-test", "COMPOSE_FILE": "docker-compose.yml:docker-compose.test.yml",
@@ -230,7 +232,64 @@ def main() -> int:
     ok = all(http("DELETE", f"{GW}{path}", None, ADMIN_TOKEN)[0] == 200 for path in (f"/admin/models/{model}", f"/admin/providers/{keyname}"))
     check("model and key removed", ok and keyname not in json.dumps(admin("GET", "/admin/providers")))
 
-    print("== 10. deployment checks")
+    print("== 10. MCP tool calls through the gate (mock tool server)")
+    srv = f"e2e-tools-{RUN}"
+    mcp_url = f"{GW}/m/{M}/mcp/{srv}"
+    call = {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {"name": "echo", "arguments": {"hello": "e2e"}}}
+    tool_count = lambda: http("GET", MOCK + "/mcp-count")[1]
+    admin("POST", "/admin/tool-servers", {"id": srv, "name": "E2E tools", "url": "http://mock-upstream:9000/mcp"})
+    before = tool_count()["count"]
+    status, data = http("POST", mcp_url, call, tokens[B])
+    check("server not allowed under the mandate: 403, never reached",
+          status == 403 and data["error"]["code"] == "TOOL_SERVER_NOT_ALLOWED" and tool_count()["count"] == before, f"HTTP {status}")
+    admin("PUT", f"/admin/mandates/{M}/tool-servers/{srv}", {"tools": ["echo"]})
+    status, _ = http("POST", mcp_url, {"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}}, tokens[B])
+    status2, data = http("POST", mcp_url, call, tokens[B])
+    seen = tool_count()
+    check("allowed tool call answered", status == 200 and status2 == 200 and "e2e" in data["result"]["content"][0]["text"], f"HTTP {status}/{status2}")
+    auth = seen["auth"] or ""
+    claims = json.loads(base64.urlsafe_b64decode(auth.split()[-1].split(".")[1] + "==")) if auth.count(".") == 2 else {}
+    check("tool server got a signed pass for B under the mandate, not B's token",
+          tokens[B] not in auth and (claims.get("sub"), claims.get("mandate"), claims.get("server")) == (B, M, srv), str(claims))
+    before = tool_count()["count"]
+    status, data = http("POST", mcp_url, {**call, "params": {"name": "delete_everything"}}, tokens[B])
+    check("tool not on the mandate's list: 403, never reached",
+          status == 403 and data["error"]["code"] == "MCP_TOOL_NOT_ALLOWED" and tool_count()["count"] == before, f"HTTP {status}")
+
+    ended = {}
+    def listen():  # an agent holding an open MCP stream (GET), as an MCP client does between tool calls
+        req = urllib.request.Request(mcp_url, headers={"Authorization": f"Bearer {tokens[B]}", "Accept": "text/event-stream"})
+        try:
+            with urllib.request.urlopen(req, timeout=60) as r:
+                while r.read(64):
+                    pass
+        except (urllib.error.URLError, ConnectionError, OSError) as e:
+            ended["error"] = repr(e)
+        ended["at"] = time.time()
+    listener = threading.Thread(target=listen, daemon=True)
+    listener.start()
+    for _ in range(50):
+        if tool_count()["streams"]:
+            break
+        time.sleep(0.1)
+    check("agent B has an open tool stream", tool_count()["streams"] == 1 and listener.is_alive())
+    model_before, tools_before = count(), tool_count()["count"]
+    t0 = time.time()
+    admin("PATCH", f"/admin/agents/{B}", {"status": "suspended"})
+    listener.join(10)
+    check("suspending B mid-task closed its open stream", "at" in ended and ended["at"] - t0 < 5, f"{ended}")
+    time.sleep(0.5)
+    check("tool server sees the stream gone", tool_count()["streams"] == 0, f"open streams={tool_count()['streams']}")
+    status, data = chat(tokens[B])
+    check("B's next model call: 403 AGENT_INACTIVE", status == 403 and data["error"]["code"] == "AGENT_INACTIVE", f"HTTP {status}")
+    status, data = http("POST", mcp_url, call, tokens[B])
+    check("B's next tool call: 403 AGENT_INACTIVE", status == 403 and data["error"]["code"] == "AGENT_INACTIVE", f"HTTP {status}")
+    check("neither the model nor the tool server was reached", count() == model_before and tool_count()["count"] == tools_before)
+    admin("PATCH", f"/admin/agents/{B}", {"status": "active"})
+    rows = [r for r in usage(agent=B) if r.get("tool_server") == srv]
+    check("tool calls recorded in usage (allowed and denied)", {r["outcome"] for r in rows} >= {"ok", "denied"}, str(len(rows)))
+
+    print("== 11. deployment checks")
     cfg = json.loads(subprocess.run(["docker", "compose", "-f", "docker-compose.yml", "config", "--format", "json"],
                                     cwd=ROOT, capture_output=True, text=True, check=True).stdout)
     published = {s: v.get("ports") for s, v in cfg["services"].items() if v.get("ports")}

@@ -79,6 +79,9 @@ services:
       ADMIN_TOKEN: ${ADMIN_TOKEN:?set in .env}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}               # DEBUG shows every step of every request (no content)
       USAGE_RETENTION_DAYS: ${USAGE_RETENTION_DAYS:-90}
+      # Where MCP tool servers (ToolHive on the host) fetch the keys that verify the gateway's passes.
+      GATEWAY_ISSUER: ${GATEWAY_ISSUER:-http://127.0.0.1:${GATEWAY_PORT:-8080}}
+    extra_hosts: ["host.docker.internal:host-gateway"]  # tool servers run on the host (ToolHive), not in this network
     ports: ["127.0.0.1:${GATEWAY_PORT:-8080}:8080"]   # the only service published to the host
     depends_on:
       migrate: { condition: service_completed_successfully }

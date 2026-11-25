@@ -51,6 +51,7 @@ const ICONS = {
   agents: "M12 3v3M7 7h10a3 3 0 0 1 3 3v7a3 3 0 0 1-3 3H7a3 3 0 0 1-3-3v-7a3 3 0 0 1 3-3zM9.5 13.5h.01M14.5 13.5h.01",
   mandates: "M4 8h16v11H4zM9 8V5h6v3M4 13h16",
   providers: "M14.5 9.5a3.5 3.5 0 1 1-1 2.5L4 21.5V18h3v-3h3l1-1M17 7h.01",
+  tools: "M14.7 6.3a4 4 0 0 0-5.4 5.4L3 18l3 3 6.3-6.3a4 4 0 0 0 5.4-5.4l-2.6 2.6-2.4-.6-.6-2.4z",
   usage: "M4 19h16M7 16V10M12 16V5M17 16v-4",
   policy: "M12 3l8 3v6c0 4.5-3.4 8.3-8 9-4.6-.7-8-4.5-8-9V6z",
   activity: "M12 7v5l3 2M21 12a9 9 0 1 1-18 0 9 9 0 0 1 18 0z",
@@ -113,6 +114,9 @@ const REASONS = {
   UPSTREAM_ERROR: "Provider error", FIELD_NOT_ALLOWED: "Field not allowed", INVALID_REQUEST: "Invalid request",
   INVALID_JSON: "Invalid JSON", CONTENT_NOT_ALLOWED: "Content not allowed", TOOL_NOT_ALLOWED: "Tool not allowed",
   STREAMING_NOT_SUPPORTED: "Streaming not supported", REQUEST_TOO_LARGE: "Request too large", ABANDONED: "Abandoned, charged",
+  TOOL_SERVER_NOT_ALLOWED: "Tool server not allowed", MCP_TOOL_NOT_ALLOWED: "Tool not allowed", TOOL_DENIED_BY_SERVER: "Refused by the tool server",
+  TOOL_SERVER_UNAVAILABLE: "Tool server unavailable", TOOL_SERVER_TIMEOUT: "Tool server timed out", TOOL_SERVER_ERROR: "Tool server error",
+  TOOL_SERVER_AUTH_FAILED: "Tool server refused the gateway's pass", STREAM_CLOSED: "Stopped by an admin change", POLICY_ERROR: "Policy error",
 };
 const reasonText = (code) => REASONS[code] || code;
 
@@ -480,7 +484,7 @@ function dailyChartCard(daily, title = "Daily spend") {
 
 // ------------------------------------------------------------------ shell, routing, sign-in
 const NAV = [
-  ["overview", "Overview"], ["agents", "Agents"], ["mandates", "Mandates"], ["providers", "Providers"], ["usage", "Usage"],
+  ["overview", "Overview"], ["agents", "Agents"], ["mandates", "Mandates"], ["providers", "Providers"], ["tools", "Tools"], ["usage", "Usage"],
   ["policy", "Policy"], ["activity", "Activity"], ["settings", "Settings"],
 ];
 const root = () => document.getElementById("app");
@@ -603,6 +607,7 @@ const ROUTES = [
   [/^\/mandates$/, () => pageMandates()],
   [/^\/mandates\/([a-z0-9-]+)$/, (m) => pageMandate(m[1])],
   [/^\/providers$/, () => pageProviders()],
+  [/^\/tools$/, () => pageTools()],
   [/^\/usage$/, (m, q) => pageUsage(q)],
   [/^\/policy$/, () => pagePolicy()],
   [/^\/activity$/, () => pageActivity()],
@@ -982,7 +987,8 @@ function usageTable(rows, { agent = true, mandate = true, compact = false, tiers
     { label: "Time", render: (r) => h("span.num.muted", when(r.at)) },
     agent && { label: "Agent", render: (r) => h("a.mono.link", { href: `#/agents/${r.agent_id}` }, r.agent_id) },
     mandate && !compact && { label: "Mandate", render: (r) => (r.mandate_id ? h("span.mono.muted", r.mandate_id) : "—") },
-    { label: "Model", render: (r) => {
+    { label: "Model or tool", render: (r) => {
+      if (r.tool_server) return h("div", h("div.mono", r.tool_name || "tool server"), h("div.cs", `tool · ${r.tool_server}`));
       if (!r.model_requested) return h("span.faint", "—");
       if (r.model_served && r.model_served !== r.model_requested) {
         return h("div", h("div.mono", r.model_served), h("div.cs", `fallback from ${r.model_requested}`));
@@ -1271,12 +1277,14 @@ const BUILTIN_TEXT = {
   AGENT_REVOKED: "The agent is revoked", AGENT_INACTIVE: "The agent is suspended",
   MANDATE_NOT_ASSIGNED: "The agent isn't on the mandate, or the mandate doesn't exist",
   MANDATE_INACTIVE: "The mandate is suspended", MODEL_NOT_ALLOWED: "The model isn't on the mandate's list",
+  TOOL_SERVER_NOT_ALLOWED: "The tool server isn't allowed under the mandate", MCP_TOOL_NOT_ALLOWED: "The tool isn't on the mandate's list for that server",
 };
-const FACT_TEXT = { "agent.id": "Agent", "mandate.id": "Mandate", "model.name": "Model" };
+const FACT_TEXT = { "agent.id": "Agent", "mandate.id": "Mandate", "model.name": "Model", "tool.server": "Tool server" };
 
 async function pagePolicy() {
-  const [p, agents, mandates, models] = await Promise.all([
-    api("GET", "/admin/policy"), api("GET", "/admin/agents"), api("GET", "/admin/mandates"), api("GET", "/admin/models")]);
+  const [p, agents, mandates, models, tools] = await Promise.all([
+    api("GET", "/admin/policy"), api("GET", "/admin/agents"), api("GET", "/admin/mandates"), api("GET", "/admin/models"),
+    api("GET", "/admin/tool-servers")]);
   const copy = () => p.custom.map((r) => ({ ...r, when: { ...r.when } }));
   let draft = copy();
   const dirty = () => JSON.stringify(draft) !== JSON.stringify(p.custom);
@@ -1325,6 +1333,7 @@ async function pagePolicy() {
   const cAgent = cond("agent.id", agents.map((a) => [a.id, a.name]));
   const cMandate = cond("mandate.id", mandates.map((m) => [m.id, m.name]));
   const cModel = cond("model.name", models.map((m) => [m.model, m.model]));
+  const cTool = cond("tool.server", tools.servers.map((s) => [s.id, s.name]));
   const reason = input({ class: "mono", placeholder: "NO_PRO_MODELS_FOR_TESTS", maxlength: "48" });
   reason.addEventListener("input", () => { reason.value = reason.value.toUpperCase().replace(/[^A-Z0-9_]/g, "_"); });
   const message = input({ placeholder: "Shown to the agent in the error", maxlength: "300" });
@@ -1332,16 +1341,19 @@ async function pagePolicy() {
   const addForm = h("form.form", { onsubmit: (e) => {
     e.preventDefault();
     addErr.clear();
-    const when = Object.fromEntries([["agent.id", cAgent.value], ["mandate.id", cMandate.value], ["model.name", cModel.value]].filter(([, v]) => v));
+    const when = Object.fromEntries([["agent.id", cAgent.value], ["mandate.id", cMandate.value], ["model.name", cModel.value],
+      ["tool.server", cTool.value]].filter(([, v]) => v));
     if (!Object.keys(when).length) return addErr.show("Pick at least one condition. A rule with none would block everything.");
+    if (when["model.name"] && when["tool.server"]) return addErr.show("A rule blocks a model or a tool server, not both. Make two rules.");
     if (!/^[A-Z][A-Z0-9_]{2,47}$/.test(reason.value)) return addErr.show("The reason code needs 3–48 capital letters, numbers or underscores, starting with a letter.");
     if (p.builtin.some((r) => r.reason === reason.value)) return addErr.show("That reason code belongs to a built-in rule. Pick another.");
     draft.push({ reason: reason.value, when, message: message.value.trim() || reason.value });
-    [cAgent, cMandate, cModel].forEach((s) => { s.value = ""; });
+    [cAgent, cMandate, cModel, cTool].forEach((s) => { s.value = ""; });
     reason.value = ""; message.value = "";
     drawRules();
   } }, h("h3.subhead", "Add a rule"), addErr,
-  h("div.sentence", "Block when", cAgent, "uses", cModel, "under", cMandate),
+  h("div.sentence", "Block when", cAgent, "uses", cModel, "or", cTool, "under", cMandate),
+  h("div.help", "A rule with a model blocks model calls; with a tool server, tool calls; with neither, both."),
   h("div.row", field("Reason code", reason), field("Message", message)),
   h("div.form-actions", h("button.btn", { type: "submit" }, icon("plus"), "Add rule")));
 
@@ -1556,6 +1568,95 @@ function openAddModel(p) {
   h("div.field", h("span.label", "Price per 1 million tokens (USD, optional)"),
     h("div.row", h("div.affix", h("span", "In $"), pin), h("div.affix", h("span", "Out $"), pout)),
     h("div.help", "Leave empty to use LiteLLM's price list. Without a price the gateway can't budget the model."))));
+  append(m.foot, h("button.btn", { type: "button", onclick: m.close }, "Cancel"), submit);
+}
+
+// ------------------------------------------------------------------ tools (MCP tool servers)
+async function pageTools() {
+  const [t, mandates] = await Promise.all([api("GET", "/admin/tool-servers"), api("GET", "/admin/mandates")]);
+  const names = Object.fromEntries(mandates.map((m) => [m.id, m.name]));
+  const act = async (method, path, body, done) => {
+    try { await api(method, path, body); toast(done); } catch (ex) { toast(ex.message, "error"); }
+    refresh();
+  };
+  const setStatus = async (s, to) => {
+    const confirmed = to === "suspended"
+      ? await ask(`Suspend ${s.name}?`, "Every agent's calls to it are blocked and its open streams end now.", "Suspend server", true)
+      : await ask(`Set ${s.name} active?`, "Agents on the mandates it's allowed under can use it again.", "Set active");
+    if (!confirmed) return false;
+    await act("PATCH", `/admin/tool-servers/${s.id}`, { status: to }, to === "active" ? `${s.name} is active again.` : `${s.name} is suspended.`);
+  };
+  const remove = async (s) => {
+    if (!(await ask(`Remove ${s.name}?`, "Agents can no longer reach it. Take it off every mandate first.", "Remove server", true))) return;
+    await act("DELETE", `/admin/tool-servers/${s.id}`, undefined, "Tool server removed.");
+  };
+  const disallow = async (s, g) => {
+    if (!(await ask(`Take ${s.name} off ${names[g.mandate_id] || g.mandate_id}?`, "Its agents' calls to this server are blocked and their open streams end now.", "Take off", true))) return;
+    await act("DELETE", `/admin/mandates/${g.mandate_id}/tool-servers/${s.id}`, undefined, "Done. Calls under that mandate are blocked.");
+  };
+
+  function serverCard(s) {
+    const free = mandates.filter((m) => !s.mandates.some((g) => g.mandate_id === m.id));
+    const pick = select([["", free.length ? "Choose a mandate…" : "Allowed under every mandate"], ...free.map((m) => [m.id, m.name])], "", { "aria-label": "Mandate" });
+    const toolList = input({ class: "mono", placeholder: "All tools (or: get_current_time, search)", "aria-label": "Allowed tools" });
+    const allow = async () => {
+      if (!pick.value) return;
+      const tools = toolList.value.split(",").map((x) => x.trim()).filter(Boolean);
+      if (!(await ask(`Allow ${s.name} under ${names[pick.value]}?`, tools.length ? `Its agents may call only: ${tools.join(", ")}.` : "Its agents may call every tool on this server.", "Allow"))) return;
+      await act("PUT", `/admin/mandates/${pick.value}/tool-servers/${s.id}`, { tools }, "Allowed. It applies to the next call.");
+    };
+    const authz = JSON.stringify(s.toolhive.authz_config, null, 2);
+    return card({ title: h("span", s.name, " ", statusPill(s.status)), hint: h("span.mono", `${s.id} → ${s.url}`),
+      actions: [segmented([["active", "Active", "ok"], ["suspended", "Suspended", "warn"]], s.status, (to) => setStatus(s, to), `Status of ${s.name}`),
+        h("button.btn.sm.danger", { type: "button", onclick: () => remove(s) }, "Remove")], flush: true,
+      body: [
+        s.mandates.length ? h("div.list", s.mandates.map((g) => h("div.li", h("span", { class: "dot ok" }),
+          h("div", h("a.t", { href: `#/mandates/${g.mandate_id}` }, names[g.mandate_id] || g.mandate_id),
+            h("div.s", g.tools.length ? chips(g.tools) : "Every tool on the server")),
+          h("button.btn.sm.ghost", { type: "button", onclick: () => disallow(s, g) }, "Take off"))))
+          : emptyState("Not allowed under any mandate", "No agent can reach it until you allow it below."),
+        h("div.card-pad", h("div.group", pick, toolList, h("button.btn", { type: "button", disabled: !free.length, onclick: allow }, icon("plus"), "Allow"))),
+        h("div.card-pad", h("div.field", h("span.label", "Run it with ToolHive on the gateway's host"),
+          copyRow(s.toolhive.command),
+          h("div.help", `Save the rules below as ${s.id}-authz.json, put the port you choose in the server's URL, and replace <server> with the MCP server (e.g. fetch, or an image).`)),
+          h("div.field", h("span.label", "ToolHive per-tool rules (Cedar)"), h("pre.cedar", { tabindex: "0", "aria-label": `ToolHive rules for ${s.name}` }, authz),
+            h("div", copyButton(authz, "Copy rules")))),
+      ] });
+  }
+
+  return [
+    pageHead({ title: "Tools", sub: "MCP tool servers agents reach only through the gateway",
+      actions: h("button.btn.primary", { type: "button", onclick: openAddToolServer }, icon("plus"), "Add tool server") }),
+    callout("info", "An agent points its MCP client at ", h("span.code", `${location.origin}/m/<mandate>/mcp/<server>`),
+      " with its own token. Each message is checked like a model call (agent, mandate, policy, budget); the tool server gets a 60-second pass signed by the gateway, never the agent's token."),
+    ...(t.servers.length ? t.servers.map(serverCard) : [card({ body: emptyState("No tool servers yet", "Add one, then allow it under a mandate.") })]),
+  ];
+}
+
+function openAddToolServer() {
+  const m = modal({ title: "Add a tool server", sub: "An MCP endpoint the gateway forwards to, usually a ToolHive proxy on this machine." });
+  const name = input({ maxlength: "200", placeholder: "Web fetch" });
+  const id = input({ class: "mono", maxlength: "64", placeholder: "fetch" });
+  let idEdited = false;
+  id.addEventListener("input", () => { idEdited = true; });
+  name.addEventListener("input", () => { if (!idEdited) id.value = slugify(name.value); });
+  const url = input({ class: "mono", value: "http://host.docker.internal:18111/mcp" });
+  const err = formError();
+  const submit = h("button.btn.primary", { type: "submit", form: "add-tool-server" }, "Add tool server");
+  append(m.body, h("form.form", { id: "add-tool-server", onsubmit: async (e) => {
+    e.preventDefault();
+    err.clear();
+    if (!name.value.trim() || !id.value) return err.show("Enter a name and an id.");
+    await busy(submit, async () => {
+      try {
+        await api("POST", "/admin/tool-servers", { id: id.value, name: name.value.trim(), url: url.value.trim() });
+        m.close();
+        toast("Tool server added. Allow it under a mandate so agents can use it.");
+        refresh();
+      } catch (ex) { err.show(ex.message); }
+    });
+  } }, err, h("div.row", field("Name", name), field("Id", id, "Lowercase, numbers and dashes. Part of the agents' URL.")),
+  field("MCP URL", url, "Where the gateway reaches it. host.docker.internal is this machine as seen from the gateway's container.")));
   append(m.foot, h("button.btn", { type: "button", onclick: m.close }, "Cancel"), submit);
 }
 

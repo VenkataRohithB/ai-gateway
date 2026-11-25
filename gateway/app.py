@@ -1,6 +1,8 @@
 """AI Agent Gateway: authorization gate in front of LiteLLM.
 
-Agent route : POST /m/{mandate}/v1/chat/completions   (agent bearer token)
+Agent routes: POST /m/{mandate}/v1/chat/completions   (agent bearer token)
+              /m/{mandate}/mcp/{server}              (MCP tool server, same token; POST/GET/DELETE)
+Discovery   : /.well-known/openid-configuration, /.well-known/jwks.json  (tool servers verify the gateway's passes)
 Admin routes: /admin/*                                 (ADMIN_TOKEN)
 Admin UI    : /admin/ui                                (static; asks for ADMIN_TOKEN)
 Health      : /health/live, /health/ready
@@ -14,12 +16,12 @@ from typing import Literal
 import asyncpg, httpx
 from fastapi import APIRouter, Depends, FastAPI, Header, Query, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-import db
+import db, toolgate
 from db import audit
-from policy import BUILTIN, CUSTOM_FACTS, Policy
+from policy import BUILTIN, CUSTOM_FACTS, TOOL_BUILTIN, Policy
 
 DATABASE_URL = os.environ["DATABASE_URL"]
 LITELLM_URL = os.environ.get("LITELLM_URL", "http://litellm:4000")
@@ -27,6 +29,8 @@ LITELLM_GATEWAY_KEY = os.environ["LITELLM_GATEWAY_KEY"]
 LITELLM_MASTER_KEY = os.environ.get("LITELLM_MASTER_KEY", "")  # only for the Providers page (keys + models in LiteLLM)
 ADMIN_TOKEN = os.environ["ADMIN_TOKEN"].encode()
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+# Where tool servers reach the gateway's discovery/JWKS; must equal their --oidc-issuer exactly.
+GATEWAY_ISSUER = os.environ.get("GATEWAY_ISSUER", "http://127.0.0.1:8080").rstrip("/")
 USAGE_RETENTION_DAYS = int(os.environ.get("USAGE_RETENTION_DAYS", "90"))
 UPSTREAM_TIMEOUT = 270  # LiteLLM 240s < gateway 270s < client 300s
 UPSTREAM_TRANSPORT = None  # tests replace this with httpx.MockTransport
@@ -56,6 +60,9 @@ class State:
     policy: Policy = Policy()
     inr_rate: Decimal = Decimal("85")
     inr_rate_updated: datetime | None = None
+    mcp: httpx.AsyncClient          # tool servers; no default auth header (each request carries its own pass)
+    signer: toolgate.Signer
+    streams = toolgate.Streams()
 
 state = State()
 
@@ -96,6 +103,8 @@ async def lifespan(app: FastAPI):
                                    headers={"Authorization": f"Bearer {LITELLM_GATEWAY_KEY}"})
     state.litellm_admin = httpx.AsyncClient(base_url=LITELLM_URL, transport=UPSTREAM_TRANSPORT, timeout=60,
                                             headers={"Authorization": f"Bearer {LITELLM_MASTER_KEY}"})
+    state.mcp = httpx.AsyncClient(transport=UPSTREAM_TRANSPORT, timeout=httpx.Timeout(None, connect=5, write=30, pool=5))
+    state.signer = await toolgate.load_signer(state.pool)
     await load_policy()   # an invalid stored policy refuses to start
     await load_settings()
     try:
@@ -106,6 +115,8 @@ async def lifespan(app: FastAPI):
     sweeper = asyncio.create_task(sweep_forever())
     yield
     sweeper.cancel()
+    state.streams.close()
+    await state.mcp.aclose()
     await state.http.aclose()
     await state.litellm_admin.aclose()
     await state.pool.close()
@@ -281,7 +292,12 @@ async def admin_update(table: str, id_: str, body: BaseModel, action: str):
         if changed:
             await audit(c, kind="admin", actor="admin", decision=action,
                         **({"agent_id": id_} if table == "agents" else {"mandate_id": id_}), detail={"changed": changed})
-        return await fetch_one(table, id_, c)
+        view = await fetch_one(table, id_, c)
+    if KILL_FIELDS & set(changed):  # after commit, so a reconnecting agent already meets the new state
+        state.streams.close(**({"agent": id_} if table == "agents" else {"mandate": id_}))
+    return view
+
+KILL_FIELDS = {"status", "budget_limit_micros", "budget_currency"}  # changes that end open tool streams
 
 @admin.get("/agents")
 async def list_agents():
@@ -367,6 +383,7 @@ async def unassign(agent_id: str, mandate_id: str):
                                    agent_id, mandate_id)
         if removed:
             await audit(c, kind="admin", actor="admin", decision="unassigned", agent_id=agent_id, mandate_id=mandate_id)
+    state.streams.close(agent=agent_id, mandate=mandate_id)
     return {"agent_id": agent_id, "mandate_id": mandate_id, "assigned": False}
 
 def usage_view(r) -> dict:
@@ -427,7 +444,7 @@ GATE_STEPS = [
     ("request", "Request check", {"FIELD_NOT_ALLOWED", "INVALID_REQUEST", "INVALID_JSON", "CONTENT_NOT_ALLOWED",
                                   "TOOL_NOT_ALLOWED", "STREAMING_NOT_SUPPORTED", "REQUEST_TOO_LARGE"}),
     ("mandate", "Mandate", {"MANDATE_NOT_ASSIGNED", "MANDATE_INACTIVE"}),
-    ("model", "Model", {"MODEL_NOT_ALLOWED"}),
+    ("model", "Model or tool", {"MODEL_NOT_ALLOWED", "TOOL_SERVER_NOT_ALLOWED", "MCP_TOOL_NOT_ALLOWED"}),
     ("policy", "Your policy rules", None),  # None = every other reason code (custom rules)
     ("rate_limit", "Rate limit", {"AGENT_RATE_LIMITED"}),
     ("budget", "Budget", {"AGENT_BUDGET_EXCEEDED", "MANDATE_BUDGET_EXCEEDED"}),
@@ -525,7 +542,7 @@ async def get_audit(agent: str | None = None, mandate: str | None = None, limit:
 async def get_policy():
     history = await state.pool.fetch(
         "SELECT version, note, created_at, jsonb_array_length(rules) AS rule_count FROM policy_versions ORDER BY version DESC LIMIT 50")
-    return {"version": state.policy.version, "number": state.policy.number, "builtin": BUILTIN,
+    return {"version": state.policy.version, "number": state.policy.number, "builtin": BUILTIN + TOOL_BUILTIN,
             "custom": state.policy.custom, "custom_facts": sorted(CUSTOM_FACTS), "cedar": state.policy.cedar,
             "history": [dict(r) for r in history]}
 
@@ -773,6 +790,120 @@ async def set_tier(name: str, body: TierUpdate):
                     detail={"changed": {"tier": {"before": before, "after": body.tier}}, "name": name})
     return tier_view(name, await tiers())
 
+# ---------------------------------------------------------------------------- tool servers (MCP)
+# A tool server is an MCP endpoint the gateway forwards to (e.g. a ToolHive proxy on the host). Agents reach it only
+# through /m/{mandate}/mcp/{server}, and only for mandates it is allowed under. Changes end open streams at once.
+class ToolServerCreate(_Strict):
+    id: str = Field(pattern=SLUG)
+    name: str = Field(min_length=1, max_length=200)
+    url: str = Field(pattern=r"^https?://[^\s]{1,500}$")
+    audience: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:/-]{1,200}$")   # default: gateway-tools-<id>
+
+class ToolServerPatch(_Strict):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    url: str | None = Field(default=None, pattern=r"^https?://[^\s]{1,500}$")
+    audience: str | None = Field(default=None, pattern=r"^[A-Za-z0-9._:/-]{1,200}$")
+    status: Literal["active", "suspended"] | None = None
+
+class ToolGrant(_Strict):
+    tools: list[str] = Field(default=[], max_length=200)   # empty = every tool on the server
+
+def toolhive_setup(s: dict, grants: list[tuple[str, list[str]]]) -> dict:
+    """What to run on the host so ToolHive accepts the gateway's passes and enforces per-tool rules."""
+    local = GATEWAY_ISSUER.startswith("http://")
+    cmd = (f"thv run --name {s['id']} --proxy-port <port> --oidc-issuer {GATEWAY_ISSUER} --oidc-audience {s['audience']} "
+           f"--authz-config {s['id']}-authz.json" + (" --oidc-insecure-allow-http --jwks-allow-private-ip" if local else "") + " <server>")
+    return {"command": cmd, "authz_config": toolgate.toolhive_config(s["id"], grants)}
+
+@admin.get("/tool-servers")
+async def list_tool_servers():
+    servers = [dict(r) for r in await state.pool.fetch("SELECT * FROM tool_servers ORDER BY id")]
+    grants = await state.pool.fetch("SELECT server_id, mandate_id, tools FROM mandate_tool_servers ORDER BY mandate_id")
+    for s in servers:
+        mine = [(g["mandate_id"], list(g["tools"])) for g in grants if g["server_id"] == s["id"]]
+        s.update(mandates=[{"mandate_id": m, "tools": t} for m, t in mine], toolhive=toolhive_setup(s, mine),
+                 agent_url=f"/m/<mandate>/mcp/{s['id']}")
+    return {"issuer": GATEWAY_ISSUER, "servers": servers}
+
+@admin.post("/tool-servers", status_code=201)
+async def create_tool_server(body: ToolServerCreate):
+    audience = body.audience or f"gateway-tools-{body.id}"
+    async with state.pool.acquire() as c, c.transaction():
+        if not await c.fetchval("INSERT INTO tool_servers (id, name, url, audience) VALUES ($1,$2,$3,$4) "
+                                "ON CONFLICT DO NOTHING RETURNING 1", body.id, body.name, body.url, audience):
+            raise GatewayError(409, "ALREADY_EXISTS", f"a tool server with id {body.id} already exists")
+        await audit(c, kind="admin", actor="admin", decision="tool_server_added",
+                    detail={"id": body.id, "name": body.name, "url": body.url, "audience": audience})
+    return {"id": body.id, "audience": audience}
+
+@admin.patch("/tool-servers/{server_id}")
+async def patch_tool_server(server_id: str, body: ToolServerPatch):
+    cols = body.model_dump(exclude_none=True)
+    if not cols:
+        raise GatewayError(400, "INVALID_REQUEST", "nothing to update")
+    async with state.pool.acquire() as c, c.transaction():
+        before = await c.fetchrow("SELECT * FROM tool_servers WHERE id=$1 FOR UPDATE", server_id)
+        if not before:
+            raise GatewayError(404, "NOT_FOUND", f"tool server {server_id} not found")
+        sets = ", ".join(f"{k}=${i + 2}" for i, k in enumerate(cols))
+        after = await c.fetchrow(f"UPDATE tool_servers SET {sets}, updated_at=now() WHERE id=$1 RETURNING *", server_id, *cols.values())
+        changed = {k: {"before": before[k], "after": after[k]} for k in cols if before[k] != after[k]}
+        if changed:
+            await audit(c, kind="admin", actor="admin", decision="tool_server_updated", detail={"id": server_id, "changed": changed})
+    if changed:
+        state.streams.close(server=server_id)
+    return dict(after)
+
+@admin.delete("/tool-servers/{server_id}")
+async def remove_tool_server(server_id: str):
+    async with state.pool.acquire() as c, c.transaction():
+        if used := [r["mandate_id"] for r in await c.fetch("SELECT mandate_id FROM mandate_tool_servers WHERE server_id=$1", server_id)]:
+            raise GatewayError(409, "IN_USE", f"remove it from these mandates first: {', '.join(used)}")
+        if not await c.fetchval("DELETE FROM tool_servers WHERE id=$1 RETURNING 1", server_id):
+            raise GatewayError(404, "NOT_FOUND", f"tool server {server_id} not found")
+        await audit(c, kind="admin", actor="admin", decision="tool_server_removed", detail={"id": server_id})
+    state.streams.close(server=server_id)
+    return {"id": server_id, "removed": True}
+
+@admin.put("/mandates/{mandate_id}/tool-servers/{server_id}")
+async def grant_tool_server(mandate_id: str, server_id: str, body: ToolGrant):
+    if bad := [t for t in body.tools if not re.match(toolgate.TOOL_NAME, t)]:
+        raise GatewayError(400, "INVALID_REQUEST", f"invalid tool name(s): {', '.join(bad[:5])}")
+    tools = sorted(set(body.tools))
+    async with state.pool.acquire() as c, c.transaction():
+        before = await c.fetchval("SELECT tools FROM mandate_tool_servers WHERE mandate_id=$1 AND server_id=$2 FOR UPDATE",
+                                  mandate_id, server_id)
+        try:
+            await c.execute("INSERT INTO mandate_tool_servers (mandate_id, server_id, tools) VALUES ($1,$2,$3) "
+                            "ON CONFLICT (mandate_id, server_id) DO UPDATE SET tools=$3", mandate_id, server_id, tools)
+        except asyncpg.ForeignKeyViolationError:
+            raise GatewayError(404, "NOT_FOUND", "mandate or tool server not found")
+        if before is None or list(before) != tools:
+            await audit(c, kind="admin", actor="admin", decision="tool_server_allowed", mandate_id=mandate_id,
+                        detail={"server": server_id, "changed": {"tools": {"before": before, "after": tools}}})
+    if before is not None and set(before or []) != set(tools):  # narrowed or changed: re-check open streams
+        state.streams.close(mandate=mandate_id, server=server_id)
+    return {"mandate_id": mandate_id, "server_id": server_id, "tools": tools}
+
+@admin.delete("/mandates/{mandate_id}/tool-servers/{server_id}")
+async def revoke_tool_server(mandate_id: str, server_id: str):
+    async with state.pool.acquire() as c, c.transaction():
+        if await c.fetchval("DELETE FROM mandate_tool_servers WHERE mandate_id=$1 AND server_id=$2 RETURNING 1", mandate_id, server_id):
+            await audit(c, kind="admin", actor="admin", decision="tool_server_disallowed", mandate_id=mandate_id,
+                        detail={"server": server_id})
+    state.streams.close(mandate=mandate_id, server=server_id)
+    return {"mandate_id": mandate_id, "server_id": server_id, "allowed": False}
+
+@app.get("/.well-known/openid-configuration", include_in_schema=False)
+async def openid_configuration():
+    """Lets a tool server (ToolHive --oidc-issuer) find the key that signs the gateway's passes."""
+    return {"issuer": GATEWAY_ISSUER, "jwks_uri": f"{GATEWAY_ISSUER}/.well-known/jwks.json", "response_types_supported": ["id_token"],
+            "subject_types_supported": ["public"], "id_token_signing_alg_values_supported": ["RS256"]}
+
+@app.get("/.well-known/jwks.json", include_in_schema=False)
+async def jwks():
+    return {"keys": [state.signer.jwk]}
+
 @app.get("/health/live")
 async def live():
     return {"status": "ok"}
@@ -940,14 +1071,8 @@ def facts_for(ctx, agent_id: str, mandate_id: str, model: str) -> dict:
             "model.allowed": model in (ctx["allowed_models"] or []) and model in state.prices,
             "agent.id": agent_id, "mandate.id": mandate_id, "model.name": model}
 
-@app.post("/m/{mandate_id}/v1/chat/completions")
-async def chat_completions(mandate_id: str, request: Request, authorization: str = Header(default="")):
-    started = time.monotonic()
-    request_id = uuid.uuid4()
-    rid = str(request_id)
-    mandate_id = mandate_id[:64]
-
-    # 1. Authenticate: identity comes only from the token.
+async def authenticate(request: Request, authorization: str, mandate_id: str, rid: str) -> str:
+    """The agent id behind the bearer token. Identity comes only from the token."""
     scheme, _, token = authorization.partition(" ")
     agent_id = None
     if scheme.lower() == "bearer" and token.startswith("gw_"):
@@ -959,6 +1084,17 @@ async def chat_completions(mandate_id: str, request: Request, authorization: str
             "INSERT INTO auth_failures (day, count) VALUES ((now() AT TIME ZONE 'Asia/Kolkata')::date, 1) "
             "ON CONFLICT (day) DO UPDATE SET count = auth_failures.count + 1")
         raise GatewayError(401, "UNAUTHORIZED", "missing or invalid agent token", request_id=rid)
+    return agent_id
+
+@app.post("/m/{mandate_id}/v1/chat/completions")
+async def chat_completions(mandate_id: str, request: Request, authorization: str = Header(default="")):
+    started = time.monotonic()
+    request_id = uuid.uuid4()
+    rid = str(request_id)
+    mandate_id = mandate_id[:64]
+
+    # 1. Authenticate.
+    agent_id = await authenticate(request, authorization, mandate_id, rid)
     policy = state.policy  # one policy version for the whole request
 
     async def finish(outcome: str, http_status: int, **fields) -> None:
@@ -1108,3 +1244,135 @@ async def forward(reservation_id: uuid.UUID, request_id: uuid.UUID, model: str, 
     status = r.status_code if 400 <= r.status_code < 600 else 502
     err = GatewayError(status, "UPSTREAM_ERROR", upstream_msg if status in (400, 404) else "model provider error")
     return ("retry" if status in RETRY_STATUSES else "final"), err, info
+
+
+# ---------------------------------------------------------------------------- MCP tool servers
+# Every MCP message (POST), stream (GET) and session end (DELETE) meets the same gate as a model call: token, agent,
+# mandate, policy (with the tool server and each tools/call name), and budget. Allowed messages are forwarded with a
+# fresh signed pass instead of the agent's token. Open streams end when an admin change could stop the agent.
+MCP_FORWARD_HEADERS = ("content-type", "accept", "mcp-session-id", "mcp-protocol-version", "last-event-id")
+MCP_RETURN_HEADERS = ("content-type", "cache-control", "mcp-session-id", "mcp-protocol-version")
+
+def _used_up(t: str) -> str:
+    """SQL: this month's spend plus holds already reach the row's budget (so not even a tool call may run)."""
+    return (f"(CASE WHEN {t}.period = budget_period() THEN {t}.spent_micros ELSE 0 END + {t}.reserved_micros >= "
+            f"CASE WHEN {t}.budget_currency = 'INR' THEN floor({t}.budget_limit_micros / $4::numeric)::bigint "
+            f"ELSE {t}.budget_limit_micros END)")
+
+async def load_tool_context(agent_id: str, mandate_id: str, server_id: str):
+    return await state.pool.fetchrow(
+        "SELECT a.status AS agent_status, m.status AS mandate_status, "
+        "EXISTS (SELECT 1 FROM agent_mandates WHERE agent_id=a.id AND mandate_id=$2) AS assigned, "
+        "s.url, s.audience, s.status AS server_status, g.tools, g.server_id IS NOT NULL AS granted, "
+        f"{_used_up('a')} AS agent_used_up, {_used_up('m')} AS mandate_used_up "
+        "FROM agents a LEFT JOIN mandates m ON m.id=$2 LEFT JOIN tool_servers s ON s.id=$3 "
+        "LEFT JOIN mandate_tool_servers g ON g.mandate_id=$2 AND g.server_id=$3 WHERE a.id=$1",
+        agent_id, mandate_id, server_id, state.inr_rate)
+
+def tool_facts(ctx, agent_id: str, mandate_id: str, server_id: str, tool: str | None) -> dict:
+    return {"agent.status": ctx["agent_status"], "assignment.exists": ctx["assigned"],
+            "mandate.status": ctx["mandate_status"] or "unknown",
+            "server.allowed": bool(ctx["granted"]) and ctx["server_status"] == "active",
+            "tool.allowed": tool is None or not ctx["tools"] or tool in ctx["tools"],
+            "agent.id": agent_id, "mandate.id": mandate_id, "tool.server": server_id}
+
+@app.api_route("/m/{mandate_id}/mcp/{server_id}", methods=["GET", "POST", "DELETE"])
+async def mcp(mandate_id: str, server_id: str, request: Request, authorization: str = Header(default="")):
+    started = time.monotonic()
+    request_id = uuid.uuid4()
+    rid = str(request_id)
+    mandate_id, server_id = mandate_id[:64], server_id[:64]
+    agent_id = await authenticate(request, authorization, mandate_id, rid)
+    policy = state.policy
+    tools: list[str] = []  # tools/call names in this message; allowed messages are written to usage only for these
+
+    async def finish(outcome: str, http_status: int, reason: str | None = None, tool: str | None = None) -> None:
+        await db.record_usage(state.pool, request_id=request_id, agent_id=agent_id, mandate_id=mandate_id, outcome=outcome,
+                              http_status=http_status, reason_code=reason, policy_version=policy.version,
+                              latency_ms=int((time.monotonic() - started) * 1000), tool_server=server_id,
+                              tool_name=tool or ", ".join(tools)[:200] or None)
+
+    async def deny(status: int, code: str, message: str, tool: str | None = None):
+        await finish("denied", status, code, tool)
+        log_event(event="deny", request_id=rid, agent=agent_id, mandate=mandate_id, server=server_id, tool=tool, reason=code)
+        raise GatewayError(status, code, message, request_id=rid, **({"policy_version": policy.version} if status in (402, 403) else {}))
+
+    raw = b""
+    if request.method == "POST":
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > MAX_BODY_BYTES:
+            await deny(413, "REQUEST_TOO_LARGE", f"body over {MAX_BODY_BYTES} bytes")
+        raw = await request.body()
+        if len(raw) > MAX_BODY_BYTES:
+            await deny(413, "REQUEST_TOO_LARGE", f"body over {MAX_BODY_BYTES} bytes")
+        try:
+            tools = toolgate.tool_calls(raw)
+        except ValueError as e:
+            await deny(400, "INVALID_REQUEST", str(e))
+
+    ctx = await load_tool_context(agent_id, mandate_id, server_id)
+    for tool in tools or [None]:
+        decision = policy.evaluate(tool_facts(ctx, agent_id, mandate_id, server_id, tool))
+        if not decision["allow"]:
+            await deny(403, decision["reason"], decision["message"], tool)
+    if ctx["agent_used_up"] or ctx["mandate_used_up"]:
+        who = "agent" if ctx["agent_used_up"] else "mandate"
+        await deny(402, f"{who.upper()}_BUDGET_EXCEEDED", f"{who} budget is used up; its tool calls are stopped too")
+
+    headers = {k: request.headers[k] for k in MCP_FORWARD_HEADERS if k in request.headers}
+    headers["authorization"] = "Bearer " + state.signer.mint(GATEWAY_ISSUER, agent_id, mandate_id, server_id, ctx["audience"])
+    try:
+        r = await state.mcp.send(state.mcp.build_request(request.method, ctx["url"], content=raw or None, headers=headers), stream=True)
+    except (httpx.ConnectError, httpx.ConnectTimeout):
+        if tools:
+            await finish("error", 503, "TOOL_SERVER_UNAVAILABLE")
+        raise GatewayError(503, "TOOL_SERVER_UNAVAILABLE", "tool server unavailable", request_id=rid)
+    except httpx.TransportError:
+        if tools:
+            await finish("timeout", 504, "TOOL_SERVER_TIMEOUT")
+        raise GatewayError(504, "TOOL_SERVER_TIMEOUT", "tool server did not answer", request_id=rid)
+    if r.status_code == 401:  # the server refused the gateway's pass: a configuration problem, not the agent's token
+        await r.aclose()
+        log_event(logging.ERROR, event="tool_server_rejected_pass", request_id=rid, server=server_id)
+        if tools:
+            await finish("error", 502, "TOOL_SERVER_AUTH_FAILED")
+        raise GatewayError(502, "TOOL_SERVER_AUTH_FAILED", "tool server did not accept the gateway's pass; check its issuer and audience",
+                           request_id=rid)
+    stop = state.streams.open(agent_id, mandate_id, server_id)
+
+    async def settle_stream(closed: bool) -> None:
+        await r.aclose()
+        if closed:
+            log_event(event="mcp_stream_closed", request_id=rid, agent=agent_id, mandate=mandate_id, server=server_id)
+        if tools:
+            ok = r.status_code < 400 and not closed
+            await finish("ok" if ok else "denied" if r.status_code == 403 else "error", r.status_code,
+                         None if ok else "STREAM_CLOSED" if closed else "TOOL_DENIED_BY_SERVER" if r.status_code == 403 else "TOOL_SERVER_ERROR")
+
+    async def relay():
+        closed, chunks, nxt, halt = False, r.aiter_bytes(), None, None  # decoded: content-encoding is not passed on
+        try:
+            while True:
+                nxt, halt = asyncio.ensure_future(anext(chunks)), asyncio.ensure_future(stop.wait())
+                await asyncio.wait({nxt, halt}, return_when=asyncio.FIRST_COMPLETED)
+                if stop.is_set():  # an admin change: end the stream now
+                    closed = True
+                    break
+                try:
+                    chunk = nxt.result()
+                except (StopAsyncIteration, httpx.TransportError):
+                    break
+                halt.cancel()
+                yield chunk
+        finally:
+            for f in (nxt, halt):
+                if f and not f.done():
+                    f.cancel()
+            state.streams.done(stop)
+            settling.add(t := asyncio.create_task(settle_stream(closed)))  # runs even if the client went away
+            t.add_done_callback(settling.discard)
+
+    out = {k: r.headers[k] for k in MCP_RETURN_HEADERS if k in r.headers}
+    return StreamingResponse(relay(), status_code=r.status_code, headers={**out, "x-request-id": rid})
+
+settling: set[asyncio.Task] = set()  # strong references, so the event loop can't drop a settle task

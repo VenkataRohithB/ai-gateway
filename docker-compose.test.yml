@@ -19,7 +19,7 @@ services:
     profiles: [tests]
     build: { context: ./gateway, target: test }
     image: ai-agent-gateway:test
-    command: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "/tests/test_policy.py", "/tests/test_gateway.py"]
+    command: ["python", "-m", "pytest", "-q", "-p", "no:cacheprovider", "/tests/test_policy.py", "/tests/test_gateway.py", "/tests/test_tools.py"]
     environment:
       DATABASE_URL: postgresql://gateway_app:${GATEWAY_APP_PASSWORD}@db:5432/gateway
       OWNER_DATABASE_URL: postgresql://gateway_owner:${GATEWAY_OWNER_PASSWORD}@db:5432/gateway

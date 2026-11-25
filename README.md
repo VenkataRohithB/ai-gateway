@@ -1,18 +1,19 @@
 # AI Agent Gateway
 
-A central gateway in front of company AI agents. Every LLM call an agent makes goes through it, and
+A central gateway in front of company AI agents. Every LLM call (and MCP tool call) an agent makes goes through it, and
 the gateway decides **who** is calling, **under which mandate**, whether policy **allows** it, and
 whether the agent's and the mandate's **monthly budgets** can cover it, *before* anything reaches a
 model provider. Everything is managed from an admin console, and any agent can be stopped on its next call.
 
 First product: SynBioAI (5 agents). First real client: ResearchOS. Plans and design record: `docs/plan/`.
 
-**Status:** v3 MVP. 120 automated tests plus an end-to-end proof through the real LiteLLM, all passing,
+**Status:** v3 MVP. 149 automated tests plus an end-to-end proof through the real LiteLLM, all passing,
 all against a fake model at **no cost**.
 
 ```
  Agent (ResearchOS, SynBioAI…) ── gw_ token ──► GATEWAY :8080 ──► LiteLLM ──► Gemini (+ any provider)
                                                  │  (FastAPI)       (internal only)
+                                                 ├─ /m/<mandate>/mcp/<server> ──signed pass──► ToolHive ──► MCP server
                                                  ├─ /admin/ui  admin console
                                                  ├─ /admin/*   admin API
                                                  └─ PostgreSQL: agents, mandates, budgets, usage, policy
@@ -23,6 +24,7 @@ all against a fake model at **no cost**.
 | **Gateway** (`gateway/`) | Agent identity, policy, monthly budgets (USD or INR), rate limits, fallback models, kill switches, usage records, admin API, admin console |
 | **LiteLLM 1.104.0** (pinned by digest, unmodified) | Provider adapters and keys, price table, per-call cost, a $10 safety cap on the gateway's own key |
 | **PostgreSQL 16** | db `gateway` (ours) and db `litellm` (LiteLLM's), each with its own least-privilege role |
+| **ToolHive** (optional, on the host) | Runs MCP tool servers in containers; verifies the gateway's signed pass and applies per-tool Cedar rules |
 
 Only the gateway is published, on `127.0.0.1:8080`. LiteLLM and Postgres sit on an internal Docker network, so
 agents cannot bypass the gate.
@@ -83,6 +85,7 @@ Provider keys are added on the console's **Providers** page (or, for the origina
 | **Overview** | This month's spend, charged calls, blocked calls, today's calls through each gate step (where blocked calls were stopped), a 30-day spend chart, and a "Needs attention" list (budgets ≥ 80%, suspended agents, calls charged without an answer, agents without a token or mandate) |
 | **Agents** | Create agents (token shown once), switch Active / Suspended / Revoked, monthly budget in USD or INR, rate limit, rotate token, assign mandates, copy each mandate's base URL, recent calls and changes |
 | **Providers** | Add AI company keys (write-only, encrypted), add models with automatic or manual prices, remove them when nothing uses them |
+| **Tools** | Add MCP tool servers, allow each under mandates (all tools or a list), suspend/remove, copy the `thv run` command and per-tool ToolHive rules |
 | **Mandates** | Create mandates, ordered model list (order = fallback order), fallback on/off, default answer limit, monthly budget, assign agents, suspend |
 | **Usage** | Every call with result, model (and fallback), tokens, cost and time taken, filterable; monthly totals by agent, mandate or model |
 | **Policy** | Built-in rules (read-only) and your own rules, saved as numbered versions with history |
@@ -144,8 +147,39 @@ $A POST /admin/agents/synbio-agent-1/token --save-token .secrets/synbio-agent-1.
 | 429 | `UPSTREAM_RATE_LIMITED` | provider quota, after trying every fallback model |
 | 400 / 413 | `FIELD_NOT_ALLOWED`, `TOOL_NOT_ALLOWED`, `STREAMING_NOT_SUPPORTED`, `CONTENT_NOT_ALLOWED`, `INVALID_REQUEST`, `REQUEST_TOO_LARGE` | bad request |
 | 503 / 504 | `UPSTREAM_UNAVAILABLE` / `UPSTREAM_TIMEOUT` | LiteLLM or the provider is down, or the call timed out |
+| 403 | `TOOL_SERVER_NOT_ALLOWED`, `MCP_TOOL_NOT_ALLOWED` | MCP route: server not allowed under the mandate, or tool not on its list |
+| 502 / 503 / 504 | `TOOL_SERVER_AUTH_FAILED` / `TOOL_SERVER_UNAVAILABLE` / `TOOL_SERVER_TIMEOUT` | MCP route: the tool server refused the gateway's pass (check its issuer and audience), is down, or didn't answer |
 
 Error bodies have the shape `{"error": {"code", "message", "request_id", …}}` and never contain internal details.
+
+### Tools (MCP servers, through ToolHive)
+
+Agents reach MCP tool servers only through the gateway, with the same token:
+```
+MCP URL  : http://127.0.0.1:8080/m/<mandate-id>/mcp/<server-id>     (streamable HTTP)
+header   : Authorization: Bearer gw_…
+```
+Every MCP message (POST), stream (GET) and session end (DELETE) meets the same gate as a model call: token, agent and
+mandate status, policy, and budget (an agent or mandate with no budget left can't call tools either). On top:
+the server must be **allowed under the mandate** (Tools page), and each `tools/call` must name a tool on the mandate's
+list for that server (empty list = every tool). Allowed messages are forwarded with a **60-second RS256 pass** signed
+by the gateway (`sub` = agent, `mandate`, `server`, `aud` = the server's audience); the agent's token never leaves the
+gateway. The gateway publishes its key at `/.well-known/openid-configuration` and `/.well-known/jwks.json`
+(`GATEWAY_ISSUER`, default `http://127.0.0.1:8080`). Suspending/revoking the agent or mandate, changing a budget,
+removing the agent from the mandate, or taking the server off the mandate **closes that agent's open MCP streams at
+once**; its next message is refused. Allowed and blocked `tools/call`s are recorded in Usage (no content).
+
+Run the tool server with [ToolHive](https://docs.stacklok.com/toolhive) on the gateway's host. The Tools page shows
+the exact command and the per-tool Cedar rules for each server, e.g.:
+```bash
+thv run --name time --transport stdio --proxy-port 18111 \
+  --oidc-issuer http://127.0.0.1:8080 --oidc-audience gateway-tools-time --authz-config time-authz.json \
+  --oidc-insecure-allow-http --jwks-allow-private-ip mcp/time
+# Tools page → Add tool server: id "time", URL http://host.docker.internal:18111/mcp → allow it under a mandate
+```
+ToolHive then rejects anything without a valid gateway pass (an agent calling it directly gets 401) and, in its own
+Cedar, permits only the tools allowed for the pass's mandate. Over HTTPS (a real `GATEWAY_ISSUER`) drop the two
+`--oidc-insecure…/--jwks…` flags. Verified with ToolHive v0.51.4 and the `mcp/time` server.
 
 ---
 
@@ -156,8 +190,11 @@ Every request is checked against an ordered list of deny rules; a match blocks i
 - **Built-in rules** (always on, checked first): agent revoked, agent suspended, not assigned to the mandate (unknown
   mandates look the same), mandate suspended, model not in the mandate's list. The budget transaction re-checks the
   same states in SQL, and a test proves the two always agree.
+- **Tool calls** have two more built-ins: tool server not allowed under the mandate (unknown servers look the same) and
+  tool not on the mandate's list for that server. They are a second Cedar action (`call_tool`).
 - **Your rules** are added in the console (Policy page): block when any combination of **agent**, **mandate** and
-  **model** matches, with your own reason code and message. Saving creates a new numbered version (`v3-1a2b3c4d`),
+  **model** or **tool server** matches (a rule with a model blocks model calls, with a tool server tool calls, with
+  neither both), with your own reason code and message. Saving creates a new numbered version (`v3-1a2b3c4d`),
   recorded on every usage row and in Activity. It applies to the next request; no restart.
 - Rules are validated on save: unknown conditions, empty conditions or a built-in reason code are refused.
 - **Evaluated by [Cedar](https://www.cedarpolicy.com/)** (`cedarpy`). Each rule becomes a `forbid` with `@id("<REASON>")`,
@@ -212,7 +249,8 @@ so a second try would arrive too late). Fallback can be switched off per mandate
 | Budget → 0 | `…_BUDGET_EXCEEDED` |
 | Rate limit | calls per minute per agent, exact under concurrency; extra calls get 429 `AGENT_RATE_LIMITED` |
 
-A request already forwarded finishes and is charged; it is not cancelled. State is in Postgres, so it survives restarts.
+Each also applies to tool calls (MCP), and ends the agent's open tool streams at once. A model request already
+forwarded finishes and is charged; it is not cancelled. State is in Postgres, so it survives restarts.
 
 ## 8. Records and logs
 
@@ -230,7 +268,7 @@ A request already forwarded finishes and is charged; it is not cancelled. State 
 ## 9. Tests (free: no real model calls)
 
 ```bash
-scripts/test.sh          # 120 pytest tests + end-to-end proof
+scripts/test.sh          # 149 pytest tests + end-to-end proof
 scripts/test.sh unit     # pytest only
 ```
 
@@ -243,8 +281,12 @@ Everything runs in a separate Compose project, `aigw-test`, with its own databas
   switch (proving the upstream count does not move), monthly rollover, INR budgets and rate changes, 50-way
   concurrency, exact rate limits, every fallback path, the worst-case estimate on real Claude/GPT/Gemini price shapes,
   failure reconciliation, sweeper, retention, reporting endpoints, console lock-down, no secrets or prompts in records.
+- **`tests/test_tools.py`:** the MCP gate with a mock tool server: signed pass verified against the JWKS (and not the
+  agent token), server/tool allow-lists, every kill switch and budget withdrawal before the server, custom tool-server
+  rules, open streams closed by suspension or disallowing, malformed messages, generated ToolHive rules.
 - **`tests/e2e_killswitch.py`:** two agents through the **real LiteLLM**: budget withdrawal, revocation, gateway down,
-  restart persistence, LiteLLM key spend = gateway charges, fallback when a model is busy, deployment checks.
+  restart persistence, LiteLLM key spend = gateway charges, fallback when a model is busy, MCP tool calls through the
+  gate (suspending an agent mid-task closes its tool stream and blocks its next model and tool call), deployment checks.
 
 **Live check (costs money on a paid key):** `tests/live_gemini.sh` makes one call through the gateway and asks first.
 
@@ -296,7 +338,10 @@ No restart. A model with no known price is refused, because the gateway can't bu
 
 ## 14. Known limitations
 
-- In-flight requests are not cancelled by a kill switch; the next request is blocked.
+- In-flight model requests are not cancelled by a kill switch; the next request is blocked. (Open MCP streams are closed.)
+- Tool calls are not priced or rate-limited; `tools/list` is not filtered by the gateway (ToolHive filters it by its rules).
+- ToolHive's network isolation pulls helper images from ghcr.io; where Docker can't pull from ghcr.io, run with
+  `--isolate-network=false`. ToolHive runs on the host, so the gateway's `extra_hosts` maps `host.docker.internal`.
 - Timeouts are charged at the full hold, even if the provider billed less.
 - Whether Gemini "thinking" tokens can exceed `max_tokens` is unverified; if they can, a call can cost more than its hold.
 - Prices are LiteLLM's table, not the provider's invoice; compare monthly.
@@ -311,8 +356,8 @@ docker-compose.yml          db, litellm, migrate, gateway
 docker-compose.debug.yml    dev only: LiteLLM on 127.0.0.1:4000
 docker-compose.test.yml     test overlay: fake model, test runner (project aigw-test)
 config/  litellm.yaml  litellm.test.yaml  db-init.sh
-gateway/ app.py (API)  db.py (ledger)  policy.py  migrate.py  migrations/  ui/ (console)  Dockerfile
+gateway/ app.py (API)  db.py (ledger)  policy.py  toolgate.py (passes, MCP streams)  migrate.py  migrations/  ui/  Dockerfile
 scripts/ gen-env.sh  litellm-setup.sh  gw_admin.py  litellm_api.py  smoke-test.sh  test.sh
-tests/   test_policy.py  test_gateway.py  e2e_killswitch.py  mock_upstream.py  live_gemini.sh
+tests/   test_policy.py  test_gateway.py  test_tools.py  e2e_killswitch.py  mock_upstream.py (+ fake MCP)  live_gemini.sh
 docs/plan/  PLAN.txt (v1 plan), PLAN-v3.txt (this version), design debate record
 ```

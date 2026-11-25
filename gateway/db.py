@@ -21,7 +21,7 @@ AUDIT_COLUMNS = {"kind", "actor", "request_id", "agent_id", "mandate_id", "model
                  "completion_tokens", "finish_reason", "upstream_status", "detail"}
 USAGE_COLUMNS = {"request_id", "agent_id", "mandate_id", "model_requested", "model_served", "outcome", "reason_code",
                  "http_status", "attempts", "prompt_tokens", "completion_tokens", "cost_micros", "reserved_micros", "cost_source",
-                 "latency_ms", "policy_version"}
+                 "latency_ms", "policy_version", "tool_server", "tool_name"}
 
 MONTH_SPENT = "CASE WHEN period = budget_period() THEN spent_micros ELSE 0 END"
 LIMIT_USD = ("CASE WHEN budget_currency = 'INR' THEN floor(budget_limit_micros / $3::numeric)::bigint "
